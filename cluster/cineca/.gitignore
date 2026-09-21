@@ -1,0 +1,4 @@
+.local/
+cluster.env
+logs/
+

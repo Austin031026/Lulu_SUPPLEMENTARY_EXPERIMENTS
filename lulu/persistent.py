@@ -129,7 +129,8 @@ def collect_batches(student, tok, rows, a, rank, world, rollout_client=None):
     for start in range(0, len(jobs), a.rollout_batch_size):
         records = []
         for index, row in jobs[start:start+a.rollout_batch_size]:
-            views = tr.build_prompt_views(tok, row['messages'], row['gold_answer'], enable_thinking=True)
+            views = tr.build_prompt_views(tok, row['messages'], row['gold_answer'], enable_thinking=True,
+                                          model_family=getattr(a, 'model_family', 'qwen'))
             cp, hp = views['causal_prompt_ids'], views['hindsight_prompt_ids']
             if max(len(cp), len(hp)) > a.max_prompt_tokens or max(len(cp), len(hp))+a.max_new_tokens > a.max_sequence_tokens:
                 raise ValueError(f'Prompt {row["id"]} exceeds configured context budget')

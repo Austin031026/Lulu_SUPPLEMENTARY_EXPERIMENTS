@@ -33,7 +33,8 @@ def prepare_models(plan, load_assets):
             continue
         destination = Path(plan['output_dir'])/'merged_models'/model['name']
         merged, tokenizer = load_assets(model['model'], dtype=resolve_dtype(plan['dtype']),
-            device='cpu', thinking=plan['thinking'], trust_remote_code=plan['trust_remote_code'],
+            device='cpu', thinking=plan['thinking'], model_family=plan.get('model_family', 'qwen'),
+            trust_remote_code=plan['trust_remote_code'],
             adapter_base_model=plan['adapter_base_model'])
         merged.save_pretrained(destination, safe_serialization=True)
         tokenizer.save_pretrained(destination)
@@ -53,8 +54,10 @@ def build_jobs(plan, shard_id, tokenizer):
         for index, row in enumerate(rows):
             if index % len(plan['devices']) != shard_id:
                 continue
-            text = tokenizer.apply_chat_template(row['prompt'], tokenize=False,
-                add_generation_prompt=True, enable_thinking=plan['thinking'])
+            from lulu.nemotron_family import apply_reasoning_template
+            text = apply_reasoning_template(tokenizer, row['prompt'],
+                family=plan.get('model_family', 'qwen'), enable_thinking=plan['thinking'],
+                tokenize=False, add_generation_prompt=True)
             ids = tokenizer(text, add_special_tokens=False)['input_ids']
             if len(ids) > plan['max_prompt_tokens']:
                 raise ValueError(f"{benchmark['name']} prompt_index={index} has {len(ids)} tokens; "

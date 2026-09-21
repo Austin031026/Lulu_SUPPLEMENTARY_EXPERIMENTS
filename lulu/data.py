@@ -338,7 +338,7 @@ def load_prepared_jsonl(path: str | Path) -> list[dict[str, Any]]:
 
 def build_prompt_views(
     tokenizer: Any, messages: Sequence[Mapping[str, str]], gold_answer: str,
-    *, enable_thinking: bool = True,
+    *, enable_thinking: bool = True, model_family: str = "qwen",
 ) -> dict[str, Any]:
     """Only the hindsight user context receives gold; neither causal nor teacher does."""
     causal = _messages(messages)
@@ -349,9 +349,12 @@ def build_prompt_views(
     # user messages. The original question is byte-identical in both views.
     hindsight[-1]["content"] += "\n\n" + HINDSIGHT_CONTEXT.format(answer=str(gold_answer).strip())
     result: dict[str, Any] = {}
+    from lulu.nemotron_family import apply_reasoning_template
     for name, view in (("causal", causal), ("hindsight", hindsight)):
-        text = tokenizer.apply_chat_template(view, tokenize=False, add_generation_prompt=True,
-                                             enable_thinking=enable_thinking)
+        text = apply_reasoning_template(
+            tokenizer, view, family=model_family, enable_thinking=enable_thinking,
+            tokenize=False, add_generation_prompt=True,
+        )
         ids = tokenizer.encode(text, add_special_tokens=False)
         result[f"{name}_prompt"] = text
         result[f"{name}_prompt_ids"] = list(ids)

@@ -69,6 +69,7 @@ def parser():
     p.add_argument('--worker-timeout', type=float, default=1800, help='Seconds without any worker progress before failing')
     p.add_argument('--model', default='Qwen/Qwen3-1.7B')
     p.add_argument('--teacher-model', default='Qwen/Qwen3-32B')
+    p.add_argument('--model-family', choices=('qwen', 'nemotron'), default='qwen')
     p.add_argument('--train-data', required=True, help='Prepared train.jsonl; use prepare_lulu_data.py')
     p.add_argument('--output-dir', required=True)
     p.add_argument('--method', choices=METHODS, default='ren_opd')
@@ -123,6 +124,8 @@ def validate_args(a):
         raise ValueError('Matched causal path currently requires ren_balanced, train microbatch=1, update passes=1')
     if getattr(a,'reasoning_ablation','ren') != 'ren' and a.method != 'ren_balanced':
         raise ValueError('Reasoning ablations require the same ren_balanced control/reference backbone')
+    if getattr(a, 'model_family', 'qwen') == 'nemotron' and a.backend != 'persistent':
+        raise ValueError('Nemotron cross-family training requires the persistent backend')
     if getattr(a,'gradient_cosines',False) and (a.method not in ('ren_shared', 'ren_balanced','ren_stable') or a.gradient_norm_every < 1):
         raise ValueError('Gradient cosines require stable backbone and a gradient norm schedule')
     if a.method in ('ren_resolved', 'ren_stable', 'ren_shared', 'ren_balanced') and (a.backend != 'persistent' or a.phase != 'run'):
@@ -399,7 +402,8 @@ def collect_phase(a):
         chunk = jobs[start:start+a.rollout_batch_size]
         records = []
         for index, row in chunk:
-            views = build_prompt_views(tok, row['messages'], row['gold_answer'], enable_thinking=True)
+            views = build_prompt_views(tok, row['messages'], row['gold_answer'], enable_thinking=True,
+                                       model_family=getattr(a, 'model_family', 'qwen'))
             cp, hp = views['causal_prompt_ids'], views['hindsight_prompt_ids']
             if max(len(cp), len(hp)) > a.max_prompt_tokens:
                 raise ValueError(f'Prompt {row["id"]} exceeds max_prompt_tokens; increase budget')

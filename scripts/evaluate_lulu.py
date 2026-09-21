@@ -89,9 +89,12 @@ def build_plan(args):
         raise ValueError('store-token-ids currently requires vLLM')
     if not 0 < args.vllm_gpu_memory_utilization < 1 or min(args.vllm_max_num_seqs, args.vllm_max_num_batched_tokens) < 1:
         raise ValueError('Invalid vLLM memory utilization or scheduler limits')
-    decoding = ("qwen-thinking" if args.thinking else "greedy") if args.decoding == "auto" else args.decoding
+    model_family = getattr(args, "model_family", "qwen")
+    decoding = (("nemotron-thinking" if model_family == "nemotron" else "qwen-thinking")
+                if args.thinking else "greedy") if args.decoding == "auto" else args.decoding
     sampling = ({"temperature": 0.6, "top_p": 0.95, "top_k": 20, "seed": args.seed}
-                if decoding == "qwen-thinking" else {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "seed": args.seed})
+                if decoding in ("qwen-thinking", "nemotron-thinking") else
+                {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "seed": args.seed})
     models = []
     if not args.checkpoint or args.include_base:
         models.append({"name": "base", "model": resolve_model_reference(args.model)})
@@ -165,7 +168,8 @@ def build_plan(args):
         "max_prompt_tokens": args.max_prompt_tokens, "max_examples": args.max_examples,
         "max_model_len": args.max_model_len, "context_safety_margin": args.context_safety_margin,
         "store_token_ids": args.store_token_ids,
-        "thinking": args.thinking, "dtype": args.dtype, "store_text": args.store_text,
+        "thinking": args.thinking, "model_family": model_family,
+        "dtype": args.dtype, "store_text": args.store_text,
         "trust_remote_code": args.trust_remote_code,
         "adapter_base_model": resolve_model_reference(args.adapter_base_model),
         "parser_path": str(parser_path), "output_dir": str(Path(args.output_dir).expanduser().resolve()),
@@ -174,7 +178,8 @@ def build_plan(args):
     }
 
 
-def load_model_assets(model_id, *, dtype, device, thinking, trust_remote_code=False, adapter_base_model=None):
+def load_model_assets(model_id, *, dtype, device, thinking, model_family="qwen",
+                      trust_remote_code=False, adapter_base_model=None):
     """Load a full HF student or an ordinary PEFT student adapter exactly once."""
     from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
@@ -218,8 +223,9 @@ def load_model_assets(model_id, *, dtype, device, thinking, trust_remote_code=Fa
             return tokenizer(*args, **kwargs)
 
         def apply_chat_template(self, *args, **kwargs):
-            kwargs["enable_thinking"] = thinking
-            return tokenizer.apply_chat_template(*args, **kwargs)
+            from lulu.nemotron_family import apply_reasoning_template
+            return apply_reasoning_template(tokenizer, *args, family=model_family,
+                                            enable_thinking=thinking, **kwargs)
 
     return model, ChatTokenizer()
 
@@ -231,6 +237,7 @@ def make_runner(plan, device):
             self.close()
             self.model, self.tokenizer = load_model_assets(
                 model_id, dtype=self.dtype, device=device, thinking=plan["thinking"],
+                model_family=plan.get("model_family", "qwen"),
                 trust_remote_code=plan["trust_remote_code"],
                 adapter_base_model=plan["adapter_base_model"],
             )
@@ -480,6 +487,7 @@ def run_suite(plan):
 def argument_parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default="Qwen/Qwen3-1.7B", help="base student identifier")
+    p.add_argument("--model-family", choices=["qwen", "nemotron"], default="qwen")
     p.add_argument("--checkpoint", action="append", default=[], metavar="NAME=PATH", help="repeat for HF/PEFT checkpoints")
     p.add_argument("--include-base", action="store_true", help="also evaluate base and compute paired deltas")
     p.add_argument("--adapter-base-model", help="override the base path stored in local PEFT adapters")
@@ -503,8 +511,8 @@ def argument_parser():
     p.add_argument("--store-token-ids", action="store_true", help="save response token IDs for positional audits")
     p.add_argument("--max-examples", type=int, default=199,
                    help="per-benchmark cap before GPU sharding; fixed first rows shared by all checkpoints; 0 means all")
-    p.add_argument("--decoding", choices=["auto", "greedy", "qwen-thinking"], default="auto",
-                   help="auto: Qwen thinking sampling when thinking is enabled, otherwise greedy")
+    p.add_argument("--decoding", choices=["auto", "greedy", "qwen-thinking", "nemotron-thinking"], default="auto",
+                   help="auto: family thinking sampling when thinking is enabled, otherwise greedy")
     p.add_argument("--seed", type=int, default=42, help="same request seeds across checkpoints")
     p.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")

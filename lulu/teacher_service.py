@@ -130,7 +130,7 @@ def score_records(model, tokenizer, records, args):
     return result
 
 
-def install_synchronous_rowwise_tp():
+def install_synchronous_rowwise_tp(*, replicated_input=False):
     """Keep native TP sharding while materializing each rowwise reduction.
 
     Transformers 4.52 returns lazy asynchronous rowwise DTensors. With PyTorch
@@ -142,6 +142,7 @@ def install_synchronous_rowwise_tp():
     subprocess; it does not modify Transformers files or Student DDP workers.
     """
     from transformers.integrations.tensor_parallel import ALL_PARALLEL_STYLES, RowwiseParallel
+    from torch.distributed.tensor import Replicate
 
     class SynchronousRowwiseParallel(RowwiseParallel):
         @staticmethod
@@ -152,21 +153,30 @@ def install_synchronous_rowwise_tp():
                 outputs = outputs + mod._bias
             return outputs.to_local() if use_local_output else outputs
 
-    # Qwen3's official plan uses "rowwise" for attention o_proj and MLP
-    # down_proj. Reuse the official partition implementation and only change
-    # when the all-reduce output becomes available to subsequent operations.
-    ALL_PARALLEL_STYLES['rowwise'] = SynchronousRowwiseParallel()
+    # Qwen3 uses rowwise; the NAS decoder receives replicated activations at
+    # each rowwise layer. Keep the official partition implementation for both.
+    if replicated_input:
+        ALL_PARALLEL_STYLES['rowwise_rep'] = SynchronousRowwiseParallel(input_layouts=Replicate())
+    else:
+        ALL_PARALLEL_STYLES['rowwise'] = SynchronousRowwiseParallel()
 
 
 def _load_teacher(args, world, device):
     from transformers import AutoConfig, AutoModelForCausalLM
-    config = AutoConfig.from_pretrained(args.teacher_model, trust_remote_code=False)
+    family = getattr(args, 'model_family', 'qwen')
+    remote_code = family == 'nemotron'
+    config = AutoConfig.from_pretrained(args.teacher_model, trust_remote_code=remote_code)
     kwargs = dict(torch_dtype=training.dtype_for(args), attn_implementation='sdpa',
-                  trust_remote_code=False, low_cpu_mem_usage=True)
+                  trust_remote_code=remote_code, low_cpu_mem_usage=True, config=config)
     if world > 1:
+        if family == 'nemotron':
+            from lulu.nemotron_family import nemotron_teacher_tp_plan
+            if getattr(args, 'teacher_tp_mode', 'native') != 'native':
+                raise ValueError('Nemotron Teacher requires native TP mode, not Qwen eager-local')
+            config.base_model_tp_plan = nemotron_teacher_tp_plan(config, world)
         if not getattr(config, 'base_model_tp_plan', None):
             raise ValueError('Teacher model has no native Transformers tensor-parallel plan; use a supported model or one Teacher GPU')
-        install_synchronous_rowwise_tp()
+        install_synchronous_rowwise_tp(replicated_input=family == 'nemotron')
         kwargs['tp_plan'] = 'auto'
     # Transformers 4.52 may redirect nonzero local-rank stdout/stderr while
     # initializing TP. Restore both so a failed worker retains useful logs.
@@ -180,6 +190,14 @@ def _load_teacher(args, world, device):
         model.to(device)
     elif not getattr(model, '_tp_plan', None):
         raise RuntimeError('Teacher tensor parallel was requested but no TP plan was installed')
+    if world > 1 and family == 'nemotron':
+        from torch.distributed.tensor import DTensor
+        sharded = {name for name, parameter in model.named_parameters()
+                   if isinstance(parameter, DTensor)}
+        if not any('.self_attn.q_proj.weight' in name for name in sharded) or not any(
+                '.self_attn.o_proj.weight' in name for name in sharded):
+            raise RuntimeError('Nemotron TP requested but attention projection weights were not sharded')
+        model._lulu_tp_runtime = f'nemotron_native_tp_sharded_parameters={len(sharded)}'
     if world > 1 and getattr(args, 'teacher_tp_mode', 'native') == 'eager-local':
         from lulu.eager_tp import materialize_qwen3_local_tp
         materialize_qwen3_local_tp(model)
