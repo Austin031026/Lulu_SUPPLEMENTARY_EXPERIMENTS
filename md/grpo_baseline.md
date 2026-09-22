@@ -15,6 +15,13 @@ on the first visible GPU. Sampling and log-probabilities use the full vocabulary
 Temperature and top-p are fixed to 1.0 because the
 historical rollout and update calculations only agree under that setting.
 
+The production schedule is rollout-compute matched to a 2,048-question,
+one-rollout-per-question baseline: GRPO deterministically selects 256 prompt
+exposures from the fixed 2,048-question pool (`global_epochs=0.125`), samples
+eight responses per prompt, and therefore produces exactly 2,048 rollouts.
+With 32 prompt groups per global batch this is eight rollout/update steps, each
+containing 256 responses. Both methods retain the same 8,192-token response cap.
+
 The production input is the fixed 2,048-question DAPO pool at
 `/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J/data/dapo_pool2048_s42/train.jsonl`.
 Its expected SHA256 is

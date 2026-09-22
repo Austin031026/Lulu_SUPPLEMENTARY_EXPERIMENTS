@@ -58,9 +58,9 @@ def parse_args():
     p.add_argument("--step", type=int, default=0)
     p.add_argument("--rollout-dir", default="")
 
-    p.add_argument("--global-batch-prompts", type=int, default=48)
+    p.add_argument("--global-batch-prompts", type=int, default=32)
     p.add_argument("--group-size", type=int, default=8)
-    p.add_argument("--global-epochs", type=float, default=1.0)
+    p.add_argument("--global-epochs", type=float, default=0.125)
     p.add_argument("--max-response-tokens", type=int, default=8192)
     p.add_argument("--max-prompt-tokens", type=int, default=4096)
 
