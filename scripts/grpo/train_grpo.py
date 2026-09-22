@@ -43,7 +43,7 @@ def parse_args():
         description=(
             "Lulu GRPO baseline. Multi-GPU phases collect "
             "on-policy rollouts without NCCL collectives; a single GPU then "
-            "performs one globally normalized LoRA policy update."
+            "performs one globally normalized policy update."
         )
     )
     p.add_argument("--phase", choices=["plan", "init", "collect", "update"], required=True)
@@ -53,6 +53,7 @@ def parse_args():
     p.add_argument("--parser-path", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--experiment-name", required=True)
+    p.add_argument("--tuning-mode", choices=["full", "lora"], default="full")
     p.add_argument("--step", type=int, default=0)
     p.add_argument("--rollout-dir", default="")
 
@@ -200,9 +201,9 @@ def load_tokenizer(args):
     return tok
 
 
-def make_base(args):
+def make_base(args, model_path=None):
     base = AutoModelForCausalLM.from_pretrained(
-        args.model,
+        str(model_path or args.model),
         torch_dtype=dtype_from_args(args),
         trust_remote_code=False,
         low_cpu_mem_usage=True,
@@ -225,18 +226,26 @@ def lora_config(args):
     )
 
 
-def load_policy(args, device, *, adapter_path: Path | None, trainable: bool):
-    base = make_base(args)
-    if adapter_path is None:
-        model = get_peft_model(base, lora_config(args))
+def policy_dir(args, step: int) -> Path:
+    name = "model" if args.tuning_mode == "full" else "adapter"
+    return checkpoint_dir(args, step) / name
+
+
+def load_policy(args, device, *, checkpoint_path: Path | None, trainable: bool):
+    if args.tuning_mode == "full":
+        model = make_base(args, checkpoint_path)
     else:
-        if not (adapter_path / "adapter_config.json").is_file():
-            raise FileNotFoundError(adapter_path / "adapter_config.json")
-        model = PeftModel.from_pretrained(
-            base,
-            str(adapter_path),
-            is_trainable=bool(trainable),
-        )
+        base = make_base(args)
+        if checkpoint_path is None:
+            model = get_peft_model(base, lora_config(args))
+        else:
+            if not (checkpoint_path / "adapter_config.json").is_file():
+                raise FileNotFoundError(checkpoint_path / "adapter_config.json")
+            model = PeftModel.from_pretrained(
+                base,
+                str(checkpoint_path),
+                is_trainable=bool(trainable),
+            )
     model = model.to(device)
     if trainable:
         model.gradient_checkpointing_enable()
@@ -454,9 +463,9 @@ def collect_phase(args, prompts: list[PromptExample]):
         print(f"[rollout][SKIP] step={args.step} rank={rank}/{world} output={out}", flush=True)
         return
 
-    prev_adapter = Path(args.output_dir).expanduser().resolve() / f"global_step_{args.step - 1}" / "adapter"
+    previous_policy = policy_dir(args, args.step - 1)
     tokenizer = load_tokenizer(args)
-    model = load_policy(args, device, adapter_path=prev_adapter, trainable=False)
+    model = load_policy(args, device, checkpoint_path=previous_policy, trainable=False)
     args._parser = load_parser(args.parser_path)
 
     groups = []
@@ -491,6 +500,7 @@ def collect_phase(args, prompts: list[PromptExample]):
     payload = {
         "schema_version": 2,
         "algorithm": args.algorithm,
+        "tuning_mode": args.tuning_mode,
         "step": int(args.step),
         "rank": rank,
         "world_size": world,
@@ -660,6 +670,7 @@ def write_config(path: Path, args, metadata):
         "schema_version": 2,
         "architecture": "multi_gpu_rollout_single_gpu_update",
         "algorithm": args.algorithm,
+        "tuning_mode": args.tuning_mode,
         "model": args.model,
         "global_batch_prompts": args.global_batch_prompts,
         "group_size": args.group_size,
@@ -685,10 +696,10 @@ def write_config(path: Path, args, metadata):
 
 def save_policy_and_optimizer(model, tokenizer, optimizer, args, step: int, metadata, metrics):
     parent = checkpoint_dir(args, step)
-    adapter = parent / "adapter"
-    adapter.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(adapter)
-    tokenizer.save_pretrained(adapter)
+    policy = policy_dir(args, step)
+    policy.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(policy)
+    tokenizer.save_pretrained(policy)
     torch.save(optimizer.state_dict(), parent / "optimizer.pt")
     write_config(parent / "rl_baseline_config.json", args, metadata)
     (parent / "update_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
@@ -697,26 +708,29 @@ def save_policy_and_optimizer(model, tokenizer, optimizer, args, step: int, meta
 def init_phase(args, prompts: list[PromptExample]):
     device = single_device()
     parent = checkpoint_dir(args, 0)
-    adapter = parent / "adapter"
-    if (adapter / "adapter_config.json").is_file():
-        print(f"[policy-rl][INIT-SKIP] {adapter}", flush=True)
+    policy = policy_dir(args, 0)
+    marker = policy / ("config.json" if args.tuning_mode == "full" else "adapter_config.json")
+    if marker.is_file():
+        print(f"[policy-rl][INIT-SKIP] {policy}", flush=True)
         return
     random.seed(args.seed)
     np.random.seed(args.seed % (2**32 - 1))
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     tokenizer = load_tokenizer(args)
-    model = load_policy(args, device, adapter_path=None, trainable=True)
-    adapter.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(adapter)
-    tokenizer.save_pretrained(adapter)
+    model = load_policy(args, device, checkpoint_path=None, trainable=True)
+    policy.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(policy)
+    tokenizer.save_pretrained(policy)
     info = plan(args, prompts)
     write_config(parent / "rl_baseline_config.json", args, {
         **info,
         "step": 0,
-        "note": "Fresh LoRA initialization used as the behavior policy for rollout step 1.",
+        "note": ("Base model copied as the full-parameter behavior policy for rollout step 1."
+                 if args.tuning_mode == "full" else
+                 "Fresh LoRA initialization used as the behavior policy for rollout step 1."),
     })
-    print(f"[policy-rl][INIT-DONE] {adapter}", flush=True)
+    print(f"[policy-rl][INIT-DONE] {policy}", flush=True)
 
 
 def update_phase(args, prompts: list[PromptExample]):
@@ -725,7 +739,7 @@ def update_phase(args, prompts: list[PromptExample]):
     device = single_device()
     out_parent = checkpoint_dir(args, args.step)
     if (
-        (out_parent / "adapter" / "adapter_config.json").is_file()
+        (policy_dir(args, args.step) / ("config.json" if args.tuning_mode == "full" else "adapter_config.json")).is_file()
         and (out_parent / "optimizer.pt").is_file()
         and (out_parent / "update_metrics.json").is_file()
     ):
@@ -734,7 +748,7 @@ def update_phase(args, prompts: list[PromptExample]):
 
     shards, stats = rollout_shards_and_stats(args, prompts)
     prev_parent = checkpoint_dir(args, args.step - 1)
-    prev_adapter = prev_parent / "adapter"
+    previous_policy = policy_dir(args, args.step - 1)
 
     random.seed(args.seed + 1009 * args.step)
     np.random.seed((args.seed + 1009 * args.step) % (2**32 - 1))
@@ -742,7 +756,7 @@ def update_phase(args, prompts: list[PromptExample]):
     torch.cuda.manual_seed_all(args.seed + 1009 * args.step)
 
     tokenizer = load_tokenizer(args)
-    model = load_policy(args, device, adapter_path=prev_adapter, trainable=True)
+    model = load_policy(args, device, checkpoint_path=previous_policy, trainable=True)
     params = [p for p in model.parameters() if p.requires_grad]
 
     optimizer = torch.optim.AdamW(
@@ -802,9 +816,9 @@ def update_phase(args, prompts: list[PromptExample]):
             "over the complete global rollout batch"
         ),
         "rollout_world_size": len(shards),
-        "lora_rank": args.lora_rank,
-        "lora_alpha": args.lora_alpha,
-        "lora_dropout": args.lora_dropout,
+        "lora_rank": args.lora_rank if args.tuning_mode == "lora" else None,
+        "lora_alpha": args.lora_alpha if args.tuning_mode == "lora" else None,
+        "lora_dropout": args.lora_dropout if args.tuning_mode == "lora" else None,
     }
     save_policy_and_optimizer(model, tokenizer, optimizer, args, args.step, metadata, metrics)
     print(

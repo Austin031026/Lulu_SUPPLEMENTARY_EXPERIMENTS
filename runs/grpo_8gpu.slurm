@@ -15,9 +15,9 @@ set -euo pipefail
 # Override these with `sbatch --export=ALL,GRPO_CODE=...,GRPO_MODEL=...,GRPO_OUTPUT_DIR=...`.
 CLUSTER_ROOT="${CLUSTER_ROOT:-/mnt/vast/home/wy21quko}"
 GRPO_CODE="${GRPO_CODE:-$CLUSTER_ROOT/code/Rona_Lulu/Lulu}"
-GRPO_MODEL="${GRPO_MODEL:-$CLUSTER_ROOT/models/DeepSeek-R1-Distill-Qwen-1.5B}"
+GRPO_MODEL="${GRPO_MODEL:-Qwen/Qwen3-1.7B}"
 GRPO_TRAIN_DATA="${GRPO_TRAIN_DATA:-$GRPO_CODE/data/grpo/train_prompts.parquet}"
-GRPO_OUTPUT_DIR="${GRPO_OUTPUT_DIR:-$CLUSTER_ROOT/results/grpo_deepseek_1p5b_seed42}"
+GRPO_OUTPUT_DIR="${GRPO_OUTPUT_DIR:-$CLUSTER_ROOT/results/grpo_qwen3_1p7b_full_thinking_seed42}"
 PYTHON_BIN="${PYTHON_BIN:-$CLUSTER_ROOT/envs/lulu/bin/python}"
 
 export GRPO_CODE GRPO_MODEL GRPO_TRAIN_DATA GRPO_OUTPUT_DIR PYTHON_BIN
@@ -29,7 +29,6 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
 mkdir -p "$CLUSTER_ROOT/slurm_logs" "$GRPO_OUTPUT_DIR" "$HF_HOME"
 test -d "$GRPO_CODE"
-test -e "$GRPO_MODEL"
 test -f "$GRPO_TRAIN_DATA"
 cd "$GRPO_CODE"
 

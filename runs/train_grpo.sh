@@ -6,10 +6,12 @@ ROOT_DIR="$(cd "$RUN_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python}}"
 
 args=(
-  --model "${GRPO_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}"
+  --model "${GRPO_MODEL:-Qwen/Qwen3-1.7B}"
   --train-data "${GRPO_TRAIN_DATA:-$ROOT_DIR/data/grpo/train_prompts.parquet}"
   --output-dir "${GRPO_OUTPUT_DIR:-${LULU_OUTPUT_ROOT:-$ROOT_DIR/outputs}/grpo}"
   --gpus "${GRPO_GPUS:-auto}"
+  --tuning-mode "${GRPO_TUNING_MODE:-full}"
+  --prompt-mode "${GRPO_PROMPT_MODE:-qwen3-thinking}"
   --global-batch-prompts "${GRPO_GLOBAL_BATCH_PROMPTS:-48}"
   --group-size "${GRPO_GROUP_SIZE:-8}"
   --global-epochs "${GRPO_GLOBAL_EPOCHS:-1.0}"

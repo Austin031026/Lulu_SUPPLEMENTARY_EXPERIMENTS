@@ -54,11 +54,13 @@ def load_reward_parser(path: Path):
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default=os.environ.get("GRPO_MODEL", "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"))
+    p.add_argument("--model", default=os.environ.get("GRPO_MODEL", "Qwen/Qwen3-1.7B"))
     p.add_argument("--train-data", default=os.environ.get("GRPO_TRAIN_DATA", str(DEFAULT_DATA)))
     p.add_argument("--parser-path", default=os.environ.get("GRPO_PARSER", str(DEFAULT_PARSER)))
     p.add_argument("--output-dir", required=True)
     p.add_argument("--gpus", default=os.environ.get("GRPO_GPUS", "auto"), help="auto, ordinals, or GPU UUIDs")
+    p.add_argument("--tuning-mode", choices=["full", "lora"], default="full")
+    p.add_argument("--prompt-mode", choices=["qwen3-thinking", "pretokenized"], default="qwen3-thinking")
     p.add_argument("--global-batch-prompts", type=int, default=48)
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--global-epochs", type=float, default=1.0)
@@ -105,6 +107,7 @@ def main():
         "--algorithm", "grpo", "--model", args.model,
         "--train-data", str(data), "--parser-path", str(parser_path),
         "--output-dir", str(output), "--experiment-name", "lulu-grpo-baseline",
+        "--tuning-mode", args.tuning_mode,
         # The exported objective is only rollout/update-consistent at T=1, top-p=1.
         "--temperature", "1.0", "--top-p", "1.0",
     ]
@@ -133,6 +136,26 @@ def main():
         raise ValueError("LiveCodeBench execution rewards are not implemented for GRPO training")
     if any(int(row["prompt_length"]) > args.max_prompt_tokens for row in rows):
         raise ValueError("Training prompt exceeds --max-prompt-tokens")
+    if args.prompt_mode == "qwen3-thinking":
+        from transformers import AutoConfig, AutoTokenizer
+
+        config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
+        if config.model_type != "qwen3":
+            raise ValueError(f"--prompt-mode qwen3-thinking requires Qwen3, got {config.model_type!r}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
+        suffix = "<|im_start|>assistant\n"
+        for row in rows:
+            length = int(row["prompt_length"])
+            ids = [int(x) for x in row["critical_prefix_ids"][:length]]
+            if not ids or min(ids) < 0 or max(ids) >= len(tokenizer):
+                raise ValueError("Training data contains token IDs outside the Qwen3 vocabulary")
+            decoded = tokenizer.decode(ids, skip_special_tokens=False)
+            if not decoded.endswith(suffix):
+                raise ValueError(
+                    "Training prompts are not Qwen3 thinking prompts. Re-tokenize the raw "
+                    "messages with enable_thinking=True; use --prompt-mode pretokenized only "
+                    "for an explicitly audited legacy dataset."
+                )
     reward = load_reward_parser(parser_path)
     for source in sorted(sources):
         if source.lower() in {"mmlu_pro", "gpqa_diamond"}:
@@ -150,6 +173,8 @@ def main():
         "output_dir": str(output),
         "rollout_devices": devices,
         "reward_sources": sorted(sources),
+        "tuning_mode": args.tuning_mode,
+        "prompt_mode": args.prompt_mode,
     })
     print(json.dumps(info, indent=2), flush=True)
     if args.plan_only:
@@ -159,6 +184,7 @@ def main():
     signature = {
         "schema_version": 1,
         "common_arguments": common,
+        "prompt_mode": args.prompt_mode,
         "rollout_devices": devices,
         "train_data_sha256": hashlib.sha256(data.read_bytes()).hexdigest(),
     }
@@ -187,10 +213,15 @@ def main():
 
     def complete(step: int) -> bool:
         parent = output / f"global_step_{step}"
-        adapter = parent / "adapter"
-        if not (adapter / "adapter_config.json").is_file():
+        policy = parent / ("model" if args.tuning_mode == "full" else "adapter")
+        config_name = "config.json" if args.tuning_mode == "full" else "adapter_config.json"
+        if not (policy / config_name).is_file():
             return False
-        if not (adapter / "adapter_model.safetensors").is_file():
+        weight_files = [
+            policy / "model.safetensors", policy / "model.safetensors.index.json",
+            policy / "pytorch_model.bin", policy / "adapter_model.safetensors",
+        ]
+        if not any(path.is_file() for path in weight_files):
             raise RuntimeError(f"Incomplete checkpoint: {parent}")
         if step and not all((parent / name).is_file() for name in ("optimizer.pt", "update_metrics.json")):
             raise RuntimeError(f"Incomplete checkpoint: {parent}")
@@ -223,7 +254,8 @@ def main():
         run(command + ["--phase", "update"] + phase + common, f"update_{step:06d}.log", update_device)
         if not complete(step):
             raise RuntimeError(f"GRPO step {step} did not produce a complete checkpoint")
-    print(f"[grpo][done] {output / f'global_step_{stop}' / 'adapter'}", flush=True)
+    policy_name = "model" if args.tuning_mode == "full" else "adapter"
+    print(f"[grpo][done] {output / f'global_step_{stop}' / policy_name}", flush=True)
 
 
 if __name__ == "__main__":

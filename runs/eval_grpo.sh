@@ -2,7 +2,7 @@
 # Evaluate a GRPO adapter with Lulu's existing held-out benchmark pipeline.
 set -euo pipefail
 
-: "${GRPO_CHECKPOINT:?Set GRPO_CHECKPOINT to global_step_N/adapter}"
+: "${GRPO_CHECKPOINT:?Set GRPO_CHECKPOINT to global_step_N/model (full) or global_step_N/adapter (LoRA)}"
 RUN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export CHECKPOINT="$GRPO_CHECKPOINT"

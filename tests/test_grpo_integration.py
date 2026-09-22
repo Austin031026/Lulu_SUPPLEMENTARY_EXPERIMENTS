@@ -19,6 +19,8 @@ def test_grpo_plan_is_cwd_independent(tmp_path):
             str(ROOT / "scripts" / "run_grpo.py"),
             "--output-dir",
             str(output),
+            "--prompt-mode",
+            "pretokenized",
             "--plan-only",
         ],
         cwd=tmp_path,
