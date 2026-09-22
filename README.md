@@ -2,6 +2,9 @@
 
 本文说明**已经实现并完成实验的 `ren_balanced` 算法**，以 `ren_balanced_matched_b256_c0p5_8k_r4_s42_20260918` 为具体训练配方。内容对照实际代码、冻结配置和运行记录整理，更新日期为 2026-09-18。
 
+独立的零 reference-KL GRPO baseline、集群训练脚本和评测入口见
+[`md/grpo_baseline.md`](md/grpo_baseline.md)。该 baseline 不改变下文的 Lulu/ReN 训练路径。
+
 > Use privileged self-distillation to estimate which external-Teacher supervision is compatible with the Student, while prioritizing corrections that differ from the Student’s current behavior.
 
 具体而言：Student 在自己的 on-policy 推理前缀上，比较“普通视角”和“知道正确最终答案的视角”对 external Teacher 分布的拟合程度。答案条件能够解释的 Teacher–Student 差异越大，该位置的 Teacher distillation 权重越大；再用按题等权的 reasoning objective 更新 Student。

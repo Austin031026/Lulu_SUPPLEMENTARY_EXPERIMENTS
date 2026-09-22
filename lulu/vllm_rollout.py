@@ -19,6 +19,11 @@ def snapshot_path(output_dir, round_index):
     return str(path)
 
 
+def isolate_vllm_allocator_environment():
+    """Keep Student allocator tuning out of the spawned vLLM service."""
+    return os.environ.pop('PYTORCH_CUDA_ALLOC_CONF', None)
+
+
 def worker(settings, gpu, rank, conn):
     engine = None
     # Die with the Student parent even if it is killed during a failed DDP round.
@@ -30,6 +35,14 @@ def worker(settings, gpu, rank, conn):
         raise SystemExit(f'Rollout service received signal {signum}')
     signal.signal(signal.SIGTERM, stop)
     try:
+        # The rollout engine uses vLLM's CuMem-backed sleep pool.  PyTorch
+        # allocator tuning inherited from the Student process can either be
+        # incompatible with that pool (``expandable_segments``) or distort
+        # vLLM's startup memory profile enough to leave no KV-cache blocks
+        # (for example ``max_split_size_mb``).  The rollout service is a
+        # spawned process, so removing the setting here leaves the Student
+        # allocator unchanged while giving vLLM its required default allocator.
+        isolate_vllm_allocator_environment()
         for key in ('RANK','LOCAL_RANK','WORLD_SIZE','LOCAL_WORLD_SIZE','MASTER_ADDR','MASTER_PORT'):
             os.environ.pop(key, None)
         os.environ.update(CUDA_VISIBLE_DEVICES=str(gpu), VLLM_WORKER_MULTIPROC_METHOD='spawn',

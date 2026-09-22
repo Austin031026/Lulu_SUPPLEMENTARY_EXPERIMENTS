@@ -42,11 +42,14 @@ def main():
     outputs = []
     for i, row in enumerate(rows):
         x = generations[i]
-        text = x.get("text")
+        # Both Lulu evaluation backends persist generated text as `response`.
+        # Accept the historical `text` spelling for compatibility with frozen
+        # external generation directories, but prefer the current row schema.
+        text = x.get("response", x.get("text"))
         if text is None:
             raise RuntimeError(
-                "LiveCodeBench generation JSONL has no `text`. "
-                "Run eval_streaming_selector.sh with STORE_TEXT=1."
+                "LiveCodeBench generation JSONL has neither `response` nor `text`. "
+                "Run evaluate_lulu.py with --store-text."
             )
         info = row.get("extra_info") or {}
         qid = str(info.get("question_id") or info.get("benchmark_id") or "")
