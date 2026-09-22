@@ -7,18 +7,18 @@
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=32
 #SBATCH --time=24:00:00
-#SBATCH --output=/mnt/vast/home/wy21quko/slurm_logs/%x-%j.out
-#SBATCH --error=/mnt/vast/home/wy21quko/slurm_logs/%x-%j.err
+#SBATCH --output=/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J/slurm_logs/%x-%j.out
+#SBATCH --error=/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J/slurm_logs/%x-%j.err
 
 set -euo pipefail
 
 # Override these with `sbatch --export=ALL,GRPO_CODE=...,GRPO_MODEL=...,GRPO_OUTPUT_DIR=...`.
-CLUSTER_ROOT="${CLUSTER_ROOT:-/mnt/vast/home/wy21quko}"
-GRPO_CODE="${GRPO_CODE:-$CLUSTER_ROOT/code/Rona_Lulu/Lulu}"
-GRPO_MODEL="${GRPO_MODEL:-Qwen/Qwen3-1.7B}"
-GRPO_TRAIN_DATA="${GRPO_TRAIN_DATA:-$GRPO_CODE/data/grpo/train_prompts.parquet}"
+CLUSTER_ROOT="${CLUSTER_ROOT:-/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J}"
+GRPO_CODE="${GRPO_CODE:-$CLUSTER_ROOT/Lulu_SUPPLEMENTARY_EXPERIMENTS}"
+GRPO_MODEL="${GRPO_MODEL:-/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Rona_Lulu/Lulu_outputs/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e}"
+GRPO_TRAIN_DATA="${GRPO_TRAIN_DATA:-$CLUSTER_ROOT/data/dapo_pool2048_s42/train.jsonl}"
 GRPO_OUTPUT_DIR="${GRPO_OUTPUT_DIR:-$CLUSTER_ROOT/results/grpo_qwen3_1p7b_full_thinking_seed42}"
-PYTHON_BIN="${PYTHON_BIN:-$CLUSTER_ROOT/envs/lulu/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-$CLUSTER_ROOT/conda/envs/lulu_nemotron_tf4524/bin/python}"
 
 export GRPO_CODE GRPO_MODEL GRPO_TRAIN_DATA GRPO_OUTPUT_DIR PYTHON_BIN
 export HF_HOME="${HF_HOME:-$CLUSTER_ROOT/hf_cache}"

@@ -56,6 +56,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default=os.environ.get("GRPO_MODEL", "Qwen/Qwen3-1.7B"))
     p.add_argument("--train-data", default=os.environ.get("GRPO_TRAIN_DATA", str(DEFAULT_DATA)))
+    p.add_argument("--expected-train-data-sha256", default=os.environ.get("GRPO_TRAIN_DATA_SHA256"))
     p.add_argument("--parser-path", default=os.environ.get("GRPO_PARSER", str(DEFAULT_PARSER)))
     p.add_argument("--output-dir", required=True)
     p.add_argument("--gpus", default=os.environ.get("GRPO_GPUS", "auto"), help="auto, ordinals, or GPU UUIDs")
@@ -102,12 +103,19 @@ def main():
     for path in (data, parser_path, TRAINER):
         if not path.is_file():
             raise FileNotFoundError(path)
+    data_sha256 = hashlib.sha256(data.read_bytes()).hexdigest()
+    if args.expected_train_data_sha256 and data_sha256 != args.expected_train_data_sha256.lower():
+        raise ValueError(
+            f"Training-data SHA256 mismatch: expected={args.expected_train_data_sha256.lower()} "
+            f"actual={data_sha256} path={data}"
+        )
 
     common = [
         "--algorithm", "grpo", "--model", args.model,
         "--train-data", str(data), "--parser-path", str(parser_path),
         "--output-dir", str(output), "--experiment-name", "lulu-grpo-baseline",
         "--tuning-mode", args.tuning_mode,
+        "--prompt-mode", args.prompt_mode,
         # The exported objective is only rollout/update-consistent at T=1, top-p=1.
         "--temperature", "1.0", "--top-p", "1.0",
     ]
@@ -128,34 +136,11 @@ def main():
     command = [sys.executable, str(TRAINER)]
     info = json.loads(subprocess.check_output(command + ["--phase", "plan"] + common, env=env, text=True))
 
-    import pyarrow.parquet as pq
-
-    rows = pq.read_table(data).to_pylist()
-    sources = {str(row.get("data_source", "math")) for row in rows}
+    sources = set(info["data_sources"])
     if "livecodebench" in {source.lower() for source in sources}:
         raise ValueError("LiveCodeBench execution rewards are not implemented for GRPO training")
-    if any(int(row["prompt_length"]) > args.max_prompt_tokens for row in rows):
+    if int(info["max_prompt_tokens_observed"]) > args.max_prompt_tokens:
         raise ValueError("Training prompt exceeds --max-prompt-tokens")
-    if args.prompt_mode == "qwen3-thinking":
-        from transformers import AutoConfig, AutoTokenizer
-
-        config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
-        if config.model_type != "qwen3":
-            raise ValueError(f"--prompt-mode qwen3-thinking requires Qwen3, got {config.model_type!r}")
-        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
-        suffix = "<|im_start|>assistant\n"
-        for row in rows:
-            length = int(row["prompt_length"])
-            ids = [int(x) for x in row["critical_prefix_ids"][:length]]
-            if not ids or min(ids) < 0 or max(ids) >= len(tokenizer):
-                raise ValueError("Training data contains token IDs outside the Qwen3 vocabulary")
-            decoded = tokenizer.decode(ids, skip_special_tokens=False)
-            if not decoded.endswith(suffix):
-                raise ValueError(
-                    "Training prompts are not Qwen3 thinking prompts. Re-tokenize the raw "
-                    "messages with enable_thinking=True; use --prompt-mode pretokenized only "
-                    "for an explicitly audited legacy dataset."
-                )
     reward = load_reward_parser(parser_path)
     for source in sorted(sources):
         if source.lower() in {"mmlu_pro", "gpqa_diamond"}:
@@ -169,6 +154,7 @@ def main():
     info.update({
         "model": args.model,
         "train_data": str(data),
+        "train_data_sha256": data_sha256,
         "parser_path": str(parser_path),
         "output_dir": str(output),
         "rollout_devices": devices,
@@ -186,7 +172,7 @@ def main():
         "common_arguments": common,
         "prompt_mode": args.prompt_mode,
         "rollout_devices": devices,
-        "train_data_sha256": hashlib.sha256(data.read_bytes()).hexdigest(),
+        "train_data_sha256": data_sha256,
     }
     metadata = output / "portable_run_config.json"
     if metadata.exists():

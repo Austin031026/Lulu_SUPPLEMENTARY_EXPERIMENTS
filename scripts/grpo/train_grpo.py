@@ -54,6 +54,7 @@ def parse_args():
     p.add_argument("--output-dir", required=True)
     p.add_argument("--experiment-name", required=True)
     p.add_argument("--tuning-mode", choices=["full", "lora"], default="full")
+    p.add_argument("--prompt-mode", choices=["qwen3-thinking", "pretokenized"], default="qwen3-thinking")
     p.add_argument("--step", type=int, default=0)
     p.add_argument("--rollout-dir", default="")
 
@@ -124,8 +125,53 @@ def extract_answer(parser, text, data_source):
         return parser.extract_answer(text)
 
 
-def load_prompts(path: str) -> list[PromptExample]:
-    rows = pq.read_table(path).to_pylist()
+def load_prompts(args) -> list[PromptExample]:
+    path = Path(args.train_data).expanduser().resolve()
+    if path.suffix.lower() == ".jsonl":
+        if args.prompt_mode != "qwen3-thinking":
+            raise ValueError("JSONL training data requires --prompt-mode qwen3-thinking")
+        from lulu.data import normalize_record
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
+        if config.model_type != "qwen3":
+            raise ValueError(f"qwen3-thinking requires a Qwen3 model, got {config.model_type!r}")
+        tokenizer = load_tokenizer(args)
+        rows = []
+        with path.open() as handle:
+            for prompt_index, line in enumerate(handle):
+                if not line.strip():
+                    continue
+                raw = json.loads(line)
+                item = normalize_record(raw)
+                prompt_ids = tokenizer.apply_chat_template(
+                    item["messages"], tokenize=True, add_generation_prompt=True,
+                    enable_thinking=True,
+                )
+                prompt_ids = [int(x) for x in prompt_ids]
+                decoded = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+                if not decoded.endswith("<|im_start|>assistant\n"):
+                    raise ValueError(f"prompt={prompt_index}: not a Qwen3 thinking prompt")
+                rows.append({
+                    "prompt_index": prompt_index,
+                    "prompt_length": len(prompt_ids),
+                    "critical_prefix_ids": prompt_ids,
+                    "data_source": str(raw.get("data_source", "math")),
+                    "ground_truth": item["gold_answer"],
+                })
+    else:
+        rows = pq.read_table(path).to_pylist()
+        if args.prompt_mode == "qwen3-thinking":
+            tokenizer = load_tokenizer(args)
+            for row in rows:
+                length = int(row["prompt_length"])
+                ids = [int(x) for x in row["critical_prefix_ids"][:length]]
+                decoded = tokenizer.decode(ids, skip_special_tokens=False)
+                if not decoded.endswith("<|im_start|>assistant\n"):
+                    raise ValueError(
+                        "Pretokenized input is not Qwen3 thinking data; provide the official "
+                        "DAPO JSONL or explicitly select --prompt-mode pretokenized."
+                    )
     by_prompt: dict[int, PromptExample] = {}
     for row in rows:
         pidx = int(row["prompt_index"])
@@ -177,6 +223,9 @@ def plan(args, prompts: list[PromptExample]):
         "scheduled_prompt_exposures": scheduled,
         "steps": steps,
         "scheduled_prompt_rollouts": scheduled * int(args.group_size),
+        "max_prompt_tokens_observed": max(len(prompt.prompt_ids) for prompt in prompts),
+        "data_sources": sorted({prompt.data_source for prompt in prompts}),
+        "prompt_mode": args.prompt_mode,
     }
 
 
@@ -848,7 +897,7 @@ def main():
             "RLPT support is controlled by stored Top-K."
         )
 
-    prompts = load_prompts(args.train_data)
+    prompts = load_prompts(args)
     if args.phase == "plan":
         print(json.dumps({
             "algorithm": args.algorithm,

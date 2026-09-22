@@ -6,8 +6,9 @@ ROOT_DIR="$(cd "$RUN_DIR/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python}}"
 
 args=(
-  --model "${GRPO_MODEL:-Qwen/Qwen3-1.7B}"
-  --train-data "${GRPO_TRAIN_DATA:-$ROOT_DIR/data/grpo/train_prompts.parquet}"
+  --model "${GRPO_MODEL:-/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Rona_Lulu/Lulu_outputs/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e}"
+  --train-data "${GRPO_TRAIN_DATA:-${DAPO_TRAIN:-/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J/data/dapo_pool2048_s42/train.jsonl}}"
+  --expected-train-data-sha256 "${GRPO_TRAIN_DATA_SHA256:-7d8e0ef07b341b90a71958e4513bacdc3e086e152f55d47245c7dd9871bc5cc4}"
   --output-dir "${GRPO_OUTPUT_DIR:-${LULU_OUTPUT_ROOT:-$ROOT_DIR/outputs}/grpo}"
   --gpus "${GRPO_GPUS:-auto}"
   --tuning-mode "${GRPO_TUNING_MODE:-full}"
