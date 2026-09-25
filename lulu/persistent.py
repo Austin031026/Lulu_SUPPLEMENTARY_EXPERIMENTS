@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import deque
 import contextlib
 import copy
+import gc
 import hashlib
 import json
 import math
@@ -349,6 +350,39 @@ def consolidate_optimizer(optimizer, a):
         optimizer.consolidate_state_dict(to=0)
 
 
+def distributed_student(step_model, device, world):
+    return (DDP(step_model, device_ids=[device.index] if device.type == 'cuda' else None,
+                broadcast_buffers=False, gradient_as_bucket_view=True)
+            if world > 1 else step_model)
+
+
+def checkpoint_memory_barrier(optimizer, distributed, rollout_client, cache, a, device):
+    """Release update-only CUDA allocations before ZeRO state consolidation.
+
+    ``ZeroRedundancyOptimizer.consolidate_state_dict()`` receives each remote
+    shard through the optimizer's CUDA process group before moving it to CPU.
+    Keeping gradients, DDP reducer buckets, and a sleeping vLLM CUDA context
+    alive at that point can exceed device capacity even though the optimizer
+    step itself completed. Gradients and rollout state are not checkpoint
+    contents, so dropping them here does not change the committed update.
+
+    The caller recreates DDP after the atomic checkpoint is published. Closing
+    vLLM is intentionally limited to sharded full-parameter runs; the next
+    collection starts a fresh engine from the newly committed checkpoint.
+    """
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    optimizer.zero_grad(set_to_none=True)
+    cache.clear()
+    if not getattr(a, 'optimizer_state_sharding', False):
+        return distributed, rollout_client
+    if rollout_client is not None:
+        rollout_client.close()
+        rollout_client = None
+    distributed = None
+    return distributed, rollout_client
+
+
 def student_worker(a, rank, world, ids, port, conn):
     rollout_client = None
     try:
@@ -378,8 +412,7 @@ def student_worker(a, rank, world, ids, port, conn):
         head = tr.base_model(student).get_output_embeddings()
         frozen_head = copy.deepcopy(head).requires_grad_(False) if any(p.requires_grad for p in head.parameters()) else head
         step_model = tr.DistillationStep(student, frozen_head, None, tok, a)
-        distributed = DDP(step_model, device_ids=[device.index] if device.type == 'cuda' else None,
-                          broadcast_buffers=False, gradient_as_bucket_view=True) if world > 1 else step_model
+        distributed = distributed_student(step_model, device, world)
         manager = checkpoint_manager(a) if rank == 0 else None
         if initial is None:
             consolidate_optimizer(optimizer, a)
@@ -450,7 +483,16 @@ def student_worker(a, rank, world, ids, port, conn):
                 optimizer_updates += int(not metrics.get('skipped_update', False))
                 metrics['completed_updates'] = optimizer_updates
                 metrics['completed_rounds'] = a.round+1
-                cache.clear()
+                command.pop('records', None)
+                del targets
+                distributed, rollout_client = checkpoint_memory_barrier(
+                    optimizer, distributed, rollout_client, cache, a, device)
+                if getattr(a, 'optimizer_state_sharding', False):
+                    # The caller's last DDP reference is gone only after the
+                    # assignment above; collect and release its buckets now.
+                    gc.collect()
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
                 consolidate_optimizer(optimizer, a)
                 if rank == 0:
                     started = time.monotonic()
@@ -459,6 +501,11 @@ def student_worker(a, rank, world, ids, port, conn):
                          'metrics': [metrics]}, final=a.round+1 == a.rounds)
                     metrics['checkpoint_seconds'] = time.monotonic()-started
                     metrics['checkpoint'] = str(path)
+                if getattr(a, 'optimizer_state_sharding', False):
+                    # Rank zero must publish the complete optimizer checkpoint
+                    # before every rank rebuilds the collective DDP wrapper.
+                    dist.barrier()
+                    distributed = distributed_student(step_model, device, world)
                 conn.send({'op': 'updated', 'rank': rank, 'round': a.round, 'metrics': metrics})
             else:
                 raise ValueError(f'Unknown Student command: {op}')

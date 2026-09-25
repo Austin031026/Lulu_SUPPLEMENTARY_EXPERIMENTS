@@ -7,7 +7,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
-from lulu.persistent import student_optimizer, consolidate_optimizer
+from lulu.persistent import (checkpoint_memory_barrier, consolidate_optimizer,
+                             student_optimizer)
 from lulu import training
 
 
@@ -57,3 +58,45 @@ def test_memory_flags_require_compatible_backend():
     with pytest.raises(ValueError,match='full-parameter'):training.validate_args(a)
     a=training.parser().parse_args(['--train-data','unused','--output-dir','unused','--rollout-vllm-sleep'])
     with pytest.raises(ValueError,match='vLLM rollout'):training.validate_args(a)
+
+
+def test_checkpoint_memory_barrier_releases_update_only_state_before_consolidation():
+    events = []
+
+    class Optimizer:
+        def zero_grad(self, *, set_to_none):
+            events.append(('zero_grad', set_to_none))
+
+    class Rollout:
+        def close(self):
+            events.append(('close_rollout', True))
+
+    distributed = object()
+    rollout = Rollout()
+    cache = {'trajectory': object()}
+    args = SimpleNamespace(optimizer_state_sharding=True)
+
+    new_distributed, new_rollout = checkpoint_memory_barrier(
+        Optimizer(), distributed, rollout, cache, args, torch.device('cpu'))
+
+    assert events == [('zero_grad', True), ('close_rollout', True)]
+    assert cache == {}
+    assert new_distributed is None
+    assert new_rollout is None
+
+
+def test_checkpoint_memory_barrier_keeps_runtime_workers_without_sharding():
+    class Optimizer:
+        def zero_grad(self, *, set_to_none):
+            assert set_to_none
+
+    distributed, rollout = object(), object()
+    cache = {'trajectory': object()}
+    args = SimpleNamespace(optimizer_state_sharding=False)
+
+    got_distributed, got_rollout = checkpoint_memory_barrier(
+        Optimizer(), distributed, rollout, cache, args, torch.device('cpu'))
+
+    assert cache == {}
+    assert got_distributed is distributed
+    assert got_rollout is rollout

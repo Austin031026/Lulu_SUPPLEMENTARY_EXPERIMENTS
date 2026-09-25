@@ -166,8 +166,13 @@ def _load_teacher(args, world, device):
     family = getattr(args, 'model_family', 'qwen')
     remote_code = family == 'nemotron'
     config = AutoConfig.from_pretrained(args.teacher_model, trust_remote_code=remote_code)
-    kwargs = dict(torch_dtype=training.dtype_for(args), attn_implementation='sdpa',
-                  trust_remote_code=remote_code, low_cpu_mem_usage=True, config=config)
+    kwargs = dict(
+        torch_dtype=training.dtype_for(args),
+        attn_implementation=('eager' if family == 'nemotron' else 'sdpa'),
+        trust_remote_code=remote_code,
+        low_cpu_mem_usage=True,
+        config=config,
+    )
     if world > 1:
         if family == 'nemotron':
             from lulu.nemotron_family import nemotron_teacher_tp_plan
