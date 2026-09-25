@@ -15,12 +15,20 @@ set -euo pipefail
 # Override these with `sbatch --export=ALL,GRPO_CODE=...,GRPO_MODEL=...,GRPO_OUTPUT_DIR=...`.
 CLUSTER_ROOT="${CLUSTER_ROOT:-/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J}"
 GRPO_CODE="${GRPO_CODE:-$CLUSTER_ROOT/Lulu_SUPPLEMENTARY_EXPERIMENTS}"
-GRPO_MODEL="${GRPO_MODEL:-/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Rona_Lulu/Lulu_outputs/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e}"
+GRPO_MODEL_FAMILY="${GRPO_MODEL_FAMILY:-qwen}"
+if [[ "$GRPO_MODEL_FAMILY" == nemotron ]]; then
+  DEFAULT_MODEL=/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J/Lulu_outputs/.cache/huggingface/hub/models--nvidia--Llama-3.1-Nemotron-Nano-4B-v1.1/snapshots/d552708a9d575fa8d4a690b988fd870d65279f98
+  DEFAULT_OUTPUT="$CLUSTER_ROOT/results/grpo_nemotron_4b_full_thinking_seed42"
+else
+  DEFAULT_MODEL=/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Rona_Lulu/Lulu_outputs/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+  DEFAULT_OUTPUT="$CLUSTER_ROOT/results/grpo_qwen3_1p7b_full_thinking_seed42"
+fi
+GRPO_MODEL="${GRPO_MODEL:-$DEFAULT_MODEL}"
 GRPO_TRAIN_DATA="${GRPO_TRAIN_DATA:-$CLUSTER_ROOT/data/dapo_pool2048_s42/train.jsonl}"
-GRPO_OUTPUT_DIR="${GRPO_OUTPUT_DIR:-$CLUSTER_ROOT/results/grpo_qwen3_1p7b_full_thinking_seed42}"
+GRPO_OUTPUT_DIR="${GRPO_OUTPUT_DIR:-$DEFAULT_OUTPUT}"
 PYTHON_BIN="${PYTHON_BIN:-$CLUSTER_ROOT/conda/envs/lulu_nemotron_tf4524/bin/python}"
 
-export GRPO_CODE GRPO_MODEL GRPO_TRAIN_DATA GRPO_OUTPUT_DIR PYTHON_BIN
+export GRPO_CODE GRPO_MODEL GRPO_MODEL_FAMILY GRPO_TRAIN_DATA GRPO_OUTPUT_DIR PYTHON_BIN
 export HF_HOME="${HF_HOME:-$CLUSTER_ROOT/hf_cache}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"

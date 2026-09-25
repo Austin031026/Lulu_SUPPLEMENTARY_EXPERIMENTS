@@ -31,6 +31,14 @@ The trainer reads its raw messages and applies the Qwen3 chat template with
 production input. `GRPO_PROMPT_MODE=pretokenized` remains only as an explicit
 legacy/test escape hatch.
 
+The same objective also supports the Nemotron/LLaMA student family without
+changing the Qwen path. Set `GRPO_MODEL_FAMILY=nemotron`; raw DAPO messages are
+then rendered with NVIDIA's `detailed thinking on` protocol. For a 4B
+full-parameter student on 80GB GPUs, use the CPU Adam update, activation
+offload, and chunked full-vocabulary log-probability path shown below. Rollout
+collection still uses every selected GPU, while the globally normalized update
+runs on the first selected GPU.
+
 ## Local or interactive cluster run
 
 Install the baseline dependencies once in the cluster environment:
@@ -46,6 +54,29 @@ GRPO_OUTPUT_DIR=/path/to/results/grpo \
 GRPO_GPUS=0,1,2,3,4,5,6,7 \
 bash runs/train_grpo.sh
 ```
+
+Nemotron Nano 4B, eight-GPU rollout with the memory-safe full update:
+
+```bash
+GRPO_MODEL=/path/to/Llama-3.1-Nemotron-Nano-4B-v1.1 \
+GRPO_MODEL_FAMILY=nemotron \
+GRPO_TRAIN_DATA=/path/to/dapo_pool2048_s42/train.jsonl \
+GRPO_OUTPUT_DIR=/path/to/results/grpo_nemotron_4b \
+GRPO_GPUS=0,1,2,3,4,5,6,7 \
+GRPO_OPTIMIZER_DEVICE=cpu \
+GRPO_ACTIVATION_OFFLOAD=1 \
+GRPO_LOGPROB_CHUNK_SIZE=16 \
+bash runs/train_grpo.sh
+```
+
+Those three memory controls are also the automatic defaults when
+`GRPO_MODEL_FAMILY=nemotron`; they are written explicitly above to make the
+production configuration auditable. The Qwen family continues to default to
+CUDA Adam, no activation offload, and an unchunked log-probability calculation.
+
+Run once with `GRPO_PLAN_ONLY=1`, then with `GRPO_MAX_STEPS=1`, before removing
+the step cap for the eight-step production run. Qwen remains the default model
+family and retains its original CUDA-Adam/non-offloaded behavior.
 
 Set `GRPO_PLAN_ONLY=1` to validate the data, reward parser, and schedule without
 loading a model. Set `GRPO_MAX_STEPS=1` for a one-step GPU smoke test. Reusing
@@ -73,7 +104,7 @@ runtime files.
 Use the repository's existing evaluator and a prepared evaluation manifest:
 
 ```bash
-GRPO_CHECKPOINT=/path/to/results/grpo/global_step_32/model \
+GRPO_CHECKPOINT=/path/to/results/grpo/global_step_8/model \
 DATA_MANIFEST=/path/to/evaluation/manifest.json \
 BENCHMARKS=math500,aime25,olympiadbench,mmlu_pro,gpqa_diamond \
 GPUS=auto \

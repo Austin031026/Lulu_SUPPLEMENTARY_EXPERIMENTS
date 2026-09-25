@@ -5,7 +5,7 @@ RUN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$RUN_DIR/.." && pwd)"
 export MODEL="${MODEL:-Qwen/Qwen3-1.7B}"
 
-args=(--model "$MODEL" --backend "${EVAL_BACKEND:-auto}"
+args=(--model "$MODEL" --model-family "${MODEL_FAMILY:-qwen}" --backend "${EVAL_BACKEND:-auto}"
       --decoding "${DECODING:-auto}" --seed "${EVAL_SEED:-42}"
       --output-dir "${OUTPUT_DIR:-${LULU_OUTPUT_ROOT:-$ROOT_DIR/outputs}/evaluation}"
       --gpus "${GPUS:-auto}" --batch-size "${BATCH_SIZE:-8}"

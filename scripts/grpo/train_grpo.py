@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import math
@@ -54,7 +55,12 @@ def parse_args():
     p.add_argument("--output-dir", required=True)
     p.add_argument("--experiment-name", required=True)
     p.add_argument("--tuning-mode", choices=["full", "lora"], default="full")
-    p.add_argument("--prompt-mode", choices=["qwen3-thinking", "pretokenized"], default="qwen3-thinking")
+    p.add_argument("--model-family", choices=["qwen", "nemotron"], default="qwen")
+    p.add_argument(
+        "--prompt-mode",
+        choices=["qwen3-thinking", "nemotron-thinking", "pretokenized"],
+        default=None,
+    )
     p.add_argument("--step", type=int, default=0)
     p.add_argument("--rollout-dir", default="")
 
@@ -74,6 +80,9 @@ def parse_args():
     p.add_argument("--dapo-clip-high", type=float, default=0.28)
     p.add_argument("--adv-eps", type=float, default=1e-6)
     p.add_argument("--ppo-epochs", type=int, default=1)
+    p.add_argument("--optimizer-device", choices=["cuda", "cpu"], default="cuda")
+    p.add_argument("--activation-offload", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--logprob-chunk-size", type=int, default=0)
 
     p.add_argument("--dapo-overlong-buffer", type=int, default=1024)
     p.add_argument("--dapo-overlong-penalty", type=float, default=1.0)
@@ -86,7 +95,12 @@ def parse_args():
     p.add_argument("--save-every", type=int, default=4)
     p.add_argument("--log-every", type=int, default=1)
     p.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.prompt_mode is None:
+        args.prompt_mode = (
+            "nemotron-thinking" if args.model_family == "nemotron" else "qwen3-thinking"
+        )
+    return args
 
 
 def worker_env():
@@ -128,13 +142,22 @@ def extract_answer(parser, text, data_source):
 def load_prompts(args) -> list[PromptExample]:
     path = Path(args.train_data).expanduser().resolve()
     if path.suffix.lower() == ".jsonl":
-        if args.prompt_mode != "qwen3-thinking":
-            raise ValueError("JSONL training data requires --prompt-mode qwen3-thinking")
+        expected_mode = (
+            "nemotron-thinking" if args.model_family == "nemotron" else "qwen3-thinking"
+        )
+        if args.prompt_mode != expected_mode:
+            raise ValueError(
+                f"JSONL training data for {args.model_family} requires "
+                f"--prompt-mode {expected_mode}"
+            )
         from lulu.data import normalize_record
+        from lulu.nemotron_family import apply_reasoning_template
         from transformers import AutoConfig
 
-        config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
-        if config.model_type != "qwen3":
+        config = AutoConfig.from_pretrained(
+            args.model, trust_remote_code=args.model_family == "nemotron"
+        )
+        if args.model_family == "qwen" and config.model_type != "qwen3":
             raise ValueError(f"qwen3-thinking requires a Qwen3 model, got {config.model_type!r}")
         tokenizer = load_tokenizer(args)
         rows = []
@@ -144,14 +167,20 @@ def load_prompts(args) -> list[PromptExample]:
                     continue
                 raw = json.loads(line)
                 item = normalize_record(raw)
-                prompt_ids = tokenizer.apply_chat_template(
-                    item["messages"], tokenize=True, add_generation_prompt=True,
+                prompt_ids = apply_reasoning_template(
+                    tokenizer,
+                    item["messages"],
+                    family=args.model_family,
                     enable_thinking=True,
+                    tokenize=True,
+                    add_generation_prompt=True,
                 )
                 prompt_ids = [int(x) for x in prompt_ids]
                 decoded = tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                if not decoded.endswith("<|im_start|>assistant\n"):
+                if args.model_family == "qwen" and not decoded.endswith("<|im_start|>assistant\n"):
                     raise ValueError(f"prompt={prompt_index}: not a Qwen3 thinking prompt")
+                if args.model_family == "nemotron" and "detailed thinking on" not in decoded:
+                    raise ValueError(f"prompt={prompt_index}: missing Nemotron thinking protocol")
                 rows.append({
                     "prompt_index": prompt_index,
                     "prompt_length": len(prompt_ids),
@@ -161,6 +190,11 @@ def load_prompts(args) -> list[PromptExample]:
                 })
     else:
         rows = pq.read_table(path).to_pylist()
+        if args.prompt_mode == "nemotron-thinking":
+            raise ValueError(
+                "Nemotron training must use the raw DAPO JSONL so prompts are tokenized "
+                "with the Nemotron tokenizer; cross-model pretokenized Parquet is unsafe"
+            )
         if args.prompt_mode == "qwen3-thinking":
             tokenizer = load_tokenizer(args)
             for row in rows:
@@ -225,15 +259,21 @@ def plan(args, prompts: list[PromptExample]):
         "scheduled_prompt_rollouts": scheduled * int(args.group_size),
         "max_prompt_tokens_observed": max(len(prompt.prompt_ids) for prompt in prompts),
         "data_sources": sorted({prompt.data_source for prompt in prompts}),
+        "model_family": args.model_family,
         "prompt_mode": args.prompt_mode,
+        "optimizer_device": args.optimizer_device,
+        "activation_offload": bool(args.activation_offload),
+        "logprob_chunk_size": int(args.logprob_chunk_size),
     }
 
 
 def global_ids_for_step(args, n: int, step: int) -> list[int]:
-    info = plan(args, [None] * n)  # only len() is used
-    if not (1 <= step <= int(info["steps"])):
-        raise ValueError(f"step={step} outside 1..{info['steps']}")
-    schedule = prompt_schedule(n, int(info["scheduled_prompt_exposures"]), int(args.seed))
+    requested = int(math.ceil(n * float(args.global_epochs)))
+    steps = int(math.ceil(requested / int(args.global_batch_prompts)))
+    scheduled = steps * int(args.global_batch_prompts)
+    if not (1 <= step <= steps):
+        raise ValueError(f"step={step} outside 1..{steps}")
+    schedule = prompt_schedule(n, scheduled, int(args.seed))
     start = (step - 1) * int(args.global_batch_prompts)
     return schedule[start : start + int(args.global_batch_prompts)]
 
@@ -243,7 +283,9 @@ def dtype_from_args(args):
 
 
 def load_tokenizer(args):
-    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
+    tok = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=args.model_family == "nemotron"
+    )
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
@@ -254,7 +296,7 @@ def make_base(args, model_path=None):
     base = AutoModelForCausalLM.from_pretrained(
         str(model_path or args.model),
         torch_dtype=dtype_from_args(args),
-        trust_remote_code=False,
+        trust_remote_code=args.model_family == "nemotron",
         low_cpu_mem_usage=True,
         attn_implementation="sdpa",
     )
@@ -570,7 +612,9 @@ def collect_phase(args, prompts: list[PromptExample]):
     )
 
 
-def token_logprobs(model, rollout: Rollout, algorithm: str, device):
+def token_logprobs(
+    model, rollout: Rollout, algorithm: str, device, *, logprob_chunk_size: int = 0,
+):
     """Teacher-force one response and return current-policy log p(a_t|s_t)."""
     prompt = rollout.prompt_ids
     response = rollout.response_ids
@@ -581,26 +625,45 @@ def token_logprobs(model, rollout: Rollout, algorithm: str, device):
     ids = torch.tensor([seq], dtype=torch.long, device=device)
     attn = torch.ones_like(ids)
     out = model(input_ids=ids, attention_mask=attn, use_cache=False, return_dict=True)
-    logits = out.logits[0].float()
+    logits = out.logits[0]
 
     start = len(prompt) - 1
     pred_logits = logits[start : start + len(response), :]
     action_ids = torch.tensor(response, dtype=torch.long, device=device)
 
+    chunk_size = int(logprob_chunk_size) or len(response)
+    if chunk_size <= 0:
+        raise ValueError("logprob_chunk_size must be nonnegative")
+
     if algorithm != "rlpt":
-        return torch.log_softmax(pred_logits, dim=-1).gather(1, action_ids[:, None]).squeeze(1)
+        pieces = []
+        for start_index in range(0, len(response), chunk_size):
+            end_index = min(len(response), start_index + chunk_size)
+            chunk = pred_logits[start_index:end_index].float()
+            chosen = action_ids[start_index:end_index]
+            pieces.append(
+                torch.log_softmax(chunk, dim=-1).gather(1, chosen[:, None]).squeeze(1)
+            )
+        return torch.cat(pieces)
 
     support = rollout.support_ids
     if support is None or len(support) != len(response):
         raise RuntimeError("RLPT rollout is missing stored support")
-    support_ids = torch.tensor(support, dtype=torch.long, device=device)
-    support_logits = pred_logits.gather(1, support_ids)
-    chosen = pred_logits.gather(1, action_ids[:, None]).squeeze(1)
-    denom = torch.logsumexp(support_logits, dim=-1)
-
-    if not bool((support_ids == action_ids[:, None]).any(dim=1).all()):
-        raise RuntimeError("sampled RLPT token absent from stored support")
-    return chosen - denom
+    pieces = []
+    for start_index in range(0, len(response), chunk_size):
+        end_index = min(len(response), start_index + chunk_size)
+        support_ids = torch.tensor(
+            support[start_index:end_index], dtype=torch.long, device=device
+        )
+        chosen_ids = action_ids[start_index:end_index]
+        chunk = pred_logits[start_index:end_index].float()
+        support_logits = chunk.gather(1, support_ids)
+        chosen = chunk.gather(1, chosen_ids[:, None]).squeeze(1)
+        denom = torch.logsumexp(support_logits, dim=-1)
+        if not bool((support_ids == chosen_ids[:, None]).any(dim=1).all()):
+            raise RuntimeError("sampled RLPT token absent from stored support")
+        pieces.append(chosen - denom)
+    return torch.cat(pieces)
 
 
 def sequence_pg_loss(curr_lp, old_lp, advantage, low, high):
@@ -688,18 +751,30 @@ def backward_group(model, group, args, device, *, global_groups: int, global_tok
     ratio_count = 0
 
     for r in valid:
-        curr = token_logprobs(model, r, algorithm, device)
-        old = torch.tensor(r.old_logprobs, dtype=torch.float32, device=device)
-        pg, ratio = sequence_pg_loss(curr, old, r.advantage, low, high)
+        saved_tensors = (
+            torch.autograd.graph.save_on_cpu(pin_memory=True)
+            if args.activation_offload
+            else contextlib.nullcontext()
+        )
+        with saved_tensors:
+            curr = token_logprobs(
+                model,
+                r,
+                algorithm,
+                device,
+                logprob_chunk_size=int(args.logprob_chunk_size),
+            )
+            old = torch.tensor(r.old_logprobs, dtype=torch.float32, device=device)
+            pg, ratio = sequence_pg_loss(curr, old, r.advantage, low, high)
 
-        if algorithm == "dapo":
-            # True token-level aggregation over the entire global rollout batch.
-            loss = pg.sum() / max(1, int(global_tokens))
-        else:
-            # Equal weight per prompt-group, mean over responses and tokens.
-            loss = pg.mean() / max(1, len(valid)) / max(1, int(global_groups))
+            if algorithm == "dapo":
+                # True token-level aggregation over the entire global rollout batch.
+                loss = pg.sum() / max(1, int(global_tokens))
+            else:
+                # Equal weight per prompt-group, mean over responses and tokens.
+                loss = pg.mean() / max(1, len(valid)) / max(1, int(global_groups))
 
-        loss.backward()
+            loss.backward()
         loss_value += float(loss.detach().item())
         clipped += int(((ratio < 1.0 - low) | (ratio > 1.0 + high)).sum().item())
         ratio_count += int(ratio.numel())
@@ -719,6 +794,7 @@ def write_config(path: Path, args, metadata):
         "schema_version": 2,
         "architecture": "multi_gpu_rollout_single_gpu_update",
         "algorithm": args.algorithm,
+        "model_family": args.model_family,
         "tuning_mode": args.tuning_mode,
         "model": args.model,
         "global_batch_prompts": args.global_batch_prompts,
@@ -732,6 +808,9 @@ def write_config(path: Path, args, metadata):
         "clip_ratio_low": args.clip_ratio,
         "clip_ratio_high": args.dapo_clip_high if args.algorithm == "dapo" else args.clip_ratio,
         "ppo_epochs": args.ppo_epochs,
+        "optimizer_device": args.optimizer_device,
+        "activation_offload": bool(args.activation_offload),
+        "logprob_chunk_size": int(args.logprob_chunk_size),
         "loss_aggregation": (
             "global-token-mean" if args.algorithm == "dapo" else "global-group-mean"
         ),
@@ -807,18 +886,26 @@ def update_phase(args, prompts: list[PromptExample]):
     tokenizer = load_tokenizer(args)
     model = load_policy(args, device, checkpoint_path=previous_policy, trainable=True)
     params = [p for p in model.parameters() if p.requires_grad]
-
-    optimizer = torch.optim.AdamW(
-        params, lr=float(args.lr), weight_decay=float(args.weight_decay)
-    )
-
     prev_opt = prev_parent / "optimizer.pt"
-    if prev_opt.is_file():
-        optimizer.load_state_dict(torch.load(prev_opt, map_location="cpu", weights_only=False))
+    if args.optimizer_device == "cpu" and int(args.ppo_epochs) != 1:
+        raise ValueError("CPU optimizer offload currently requires --ppo-epochs 1")
+
+    optimizer = None
+    if args.optimizer_device == "cuda":
+        optimizer = torch.optim.AdamW(
+            params, lr=float(args.lr), weight_decay=float(args.weight_decay)
+        )
+        if prev_opt.is_file():
+            optimizer.load_state_dict(
+                torch.load(prev_opt, map_location="cpu", weights_only=False)
+            )
 
     epoch_metrics = []
     for ppo_epoch in range(int(args.ppo_epochs)):
-        optimizer.zero_grad(set_to_none=True)
+        if optimizer is None:
+            model.zero_grad(set_to_none=True)
+        else:
+            optimizer.zero_grad(set_to_none=True)
         losses = []
         clipfracs = []
         for g in iter_rollout_groups(shards):
@@ -834,12 +921,30 @@ def update_phase(args, prompts: list[PromptExample]):
             clipfracs.append(float(m["clipfrac"]))
 
         grad = torch.nn.utils.clip_grad_norm_(params, float(args.clip_grad))
+        grad_value = float(grad)
+        if args.optimizer_device == "cpu":
+            # The 4B full-parameter path cannot safely materialize Adam state beside
+            # model weights, gradients and long-sequence activations on one 80GB GPU.
+            # Move parameters and their accumulated gradients to CPU before creating
+            # or restoring Adam.  The process exits after this single PPO epoch, so
+            # no device round-trip is required before checkpointing.
+            model.to("cpu")
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+            params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(
+                params, lr=float(args.lr), weight_decay=float(args.weight_decay)
+            )
+            if prev_opt.is_file():
+                optimizer.load_state_dict(
+                    torch.load(prev_opt, map_location="cpu", weights_only=False)
+                )
         optimizer.step()
         epoch_metrics.append({
             "ppo_epoch": ppo_epoch + 1,
             "loss": float(sum(losses)),
             "clipfrac_group_mean": float(sum(clipfracs) / max(1, len(clipfracs))),
-            "grad_norm": float(grad),
+            "grad_norm": grad_value,
         })
 
     reward_mean = stats["raw_reward_sum"] / max(1, stats["raw_reward_n"])
@@ -891,6 +996,16 @@ def main():
         raise ValueError("rlpt-k must be >=2")
     if args.temperature <= 0:
         raise ValueError("temperature must be >0")
+    if args.logprob_chunk_size < 0:
+        raise ValueError("logprob-chunk-size must be nonnegative")
+    expected_prompt_mode = (
+        "nemotron-thinking" if args.model_family == "nemotron" else "qwen3-thinking"
+    )
+    if args.prompt_mode not in {expected_prompt_mode, "pretokenized"}:
+        raise ValueError(
+            f"model-family={args.model_family} requires prompt-mode={expected_prompt_mode} "
+            "for raw data, or pretokenized for an explicitly compatible frozen input"
+        )
     if abs(args.top_p - 1.0) > 1e-12:
         raise ValueError(
             "This compute-matched implementation intentionally fixes top_p=1.0; "

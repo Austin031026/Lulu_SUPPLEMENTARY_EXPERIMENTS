@@ -61,7 +61,16 @@ def parse_args():
     p.add_argument("--output-dir", required=True)
     p.add_argument("--gpus", default=os.environ.get("GRPO_GPUS", "auto"), help="auto, ordinals, or GPU UUIDs")
     p.add_argument("--tuning-mode", choices=["full", "lora"], default="full")
-    p.add_argument("--prompt-mode", choices=["qwen3-thinking", "pretokenized"], default="qwen3-thinking")
+    p.add_argument(
+        "--model-family",
+        choices=["qwen", "nemotron"],
+        default=os.environ.get("GRPO_MODEL_FAMILY", "qwen"),
+    )
+    p.add_argument(
+        "--prompt-mode",
+        choices=["qwen3-thinking", "nemotron-thinking", "pretokenized"],
+        default=os.environ.get("GRPO_PROMPT_MODE"),
+    )
     p.add_argument("--global-batch-prompts", type=int, default=32)
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--global-epochs", type=float, default=0.125)
@@ -72,6 +81,29 @@ def parse_args():
     p.add_argument("--clip-grad", type=float, default=1.0)
     p.add_argument("--clip-ratio", type=float, default=0.2)
     p.add_argument("--ppo-epochs", type=int, default=1)
+    p.add_argument(
+        "--optimizer-device",
+        choices=["cuda", "cpu"],
+        default=os.environ.get("GRPO_OPTIMIZER_DEVICE"),
+    )
+    p.add_argument(
+        "--activation-offload",
+        action=argparse.BooleanOptionalAction,
+        default=(
+            None
+            if "GRPO_ACTIVATION_OFFLOAD" not in os.environ
+            else os.environ["GRPO_ACTIVATION_OFFLOAD"] == "1"
+        ),
+    )
+    p.add_argument(
+        "--logprob-chunk-size",
+        type=int,
+        default=(
+            None
+            if "GRPO_LOGPROB_CHUNK_SIZE" not in os.environ
+            else int(os.environ["GRPO_LOGPROB_CHUNK_SIZE"])
+        ),
+    )
     p.add_argument("--lora-rank", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lora-dropout", type=float, default=0.05)
@@ -84,6 +116,19 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.prompt_mode is None:
+        args.prompt_mode = (
+            "nemotron-thinking" if args.model_family == "nemotron" else "qwen3-thinking"
+        )
+    # Full-parameter Nemotron-4B updates need materially more memory than the
+    # historical Qwen-1.7B baseline.  Select conservative defaults only for
+    # that family; explicit CLI/environment values always win.
+    if args.optimizer_device is None:
+        args.optimizer_device = "cpu" if args.model_family == "nemotron" else "cuda"
+    if args.activation_offload is None:
+        args.activation_offload = args.model_family == "nemotron"
+    if args.logprob_chunk_size is None:
+        args.logprob_chunk_size = 16 if args.model_family == "nemotron" else 0
     try:
         devices = visible_devices(args.gpus)
     except ValueError as exc:
@@ -115,6 +160,7 @@ def main():
         "--train-data", str(data), "--parser-path", str(parser_path),
         "--output-dir", str(output), "--experiment-name", "lulu-grpo-baseline",
         "--tuning-mode", args.tuning_mode,
+        "--model-family", args.model_family,
         "--prompt-mode", args.prompt_mode,
         # The exported objective is only rollout/update-consistent at T=1, top-p=1.
         "--temperature", "1.0", "--top-p", "1.0",
@@ -122,9 +168,11 @@ def main():
     for name in (
         "global_batch_prompts", "group_size", "global_epochs", "max_response_tokens",
         "max_prompt_tokens", "lr", "weight_decay", "clip_grad", "clip_ratio",
-        "ppo_epochs", "lora_rank", "lora_alpha", "lora_dropout", "seed", "dtype",
+        "ppo_epochs", "optimizer_device", "logprob_chunk_size",
+        "lora_rank", "lora_alpha", "lora_dropout", "seed", "dtype",
     ):
         common.extend(["--" + name.replace("_", "-"), str(getattr(args, name))])
+    common.append("--activation-offload" if args.activation_offload else "--no-activation-offload")
 
     pythonpath = os.environ.get("PYTHONPATH", "")
     env = dict(
@@ -160,7 +208,11 @@ def main():
         "rollout_devices": devices,
         "reward_sources": sorted(sources),
         "tuning_mode": args.tuning_mode,
+        "model_family": args.model_family,
         "prompt_mode": args.prompt_mode,
+        "optimizer_device": args.optimizer_device,
+        "activation_offload": bool(args.activation_offload),
+        "logprob_chunk_size": int(args.logprob_chunk_size),
     })
     print(json.dumps(info, indent=2), flush=True)
     if args.plan_only:
