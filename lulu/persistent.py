@@ -32,11 +32,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from lulu import training as tr
 from lulu.checkpoints import CheckpointManager
+from lulu.cost import efficient, needs_teacher, needs_hindsight, synchronize, summarize_workers
 
 
 def allocate_roles(a):
     needs_h = a.method in ('ren_shared', 'ren_balanced', 'ren_stable', 'ren_resolved', 'ren_opd', 'ren_graft', 'opsd', 'union_topk')
-    needs_t = a.method != 'opsd'
+    needs_t = a.method != 'opsd' and needs_teacher(a)
     if a.cpu:
         return {'student': [], 'hindsight': [] if needs_h else None,
                 'teacher': [] if needs_t else None}
@@ -137,6 +138,9 @@ def collect_batches(student, tok, rows, a, rank, world, rollout_client=None):
                 raise ValueError(f'Prompt {row["id"]} exceeds configured context budget')
             records.append(dict(index=index, source_id=row['id'], causal_prompt_ids=cp,
                                 hindsight_prompt_ids=hp, snapshot_round=a.round, gold_answer=row['gold_answer']))
+        if efficient(a):
+            synchronize()
+        generation_started = time.monotonic()
         if rollout_client is not None:
             responses, finish_reasons = rollout_client.generate(records, a.round)
         else:
@@ -149,6 +153,11 @@ def collect_batches(student, tok, rows, a, rank, world, rollout_client=None):
                     pad_token_id=tok.pad_token_id, eos_token_id=eos, use_cache=True)
             responses = output[:, batch['input_ids'].shape[1]:].tolist()
             finish_reasons = [None]*len(responses)
+        if efficient(a):
+            synchronize()
+            generation_elapsed = time.monotonic()-generation_started
+            a._cost_collection['generation_request_seconds'] += generation_elapsed
+            a._cost_collection['generation_seconds'] += (rollout_client.last_result['seconds'] if rollout_client is not None else generation_elapsed)
         for r, response, finish in zip(records, responses, finish_reasons):
             stop = next((i+1 for i, token in enumerate(response) if token in eos_set), len(response))
             r['response_ids'] = response[:stop]
@@ -167,6 +176,7 @@ def collect_batches(student, tok, rows, a, rank, world, rollout_client=None):
             r['truncated'] = (finish == 'length') if finish else not bool(response[:stop] and response[stop-1] in eos_set)
         payloads = []
         causal_batch_size = a.train_micro_batch_size if getattr(a,'match_causal_update',False) else a.score_batch_size
+        causal_started = time.monotonic()
         with torch.inference_mode():
             for offset in range(0, len(records), causal_batch_size):
                 part = records[offset:offset+causal_batch_size]
@@ -183,6 +193,9 @@ def collect_batches(student, tok, rows, a, rank, world, rollout_client=None):
                         payload['causal_topk_ids'] = torch.cat(topk) if topk else torch.empty((0, k), dtype=torch.long)
                     r.pop('hindsight_prompt_ids')
                     payloads.append(payload)
+        if efficient(a):
+            synchronize()
+            a._cost_collection['causal_scoring_seconds'] += time.monotonic()-causal_started
         yield records, payloads
 
 
@@ -224,7 +237,7 @@ def update_records(step_model, distributed, optimizer, records, dummy, a, rank, 
     for record in records:
         if record['snapshot_round'] != a.round:
             raise RuntimeError('Stale Student rollout snapshot')
-        if a.method != 'opsd' and not record.get('teacher_scored'):
+        if a.method != 'opsd' and needs_teacher(a) and not record.get('teacher_scored'):
             raise RuntimeError('Missing Teacher target')
     resolved = a.method == 'ren_resolved'
     stable = a.method in ('ren_stable', 'ren_shared', 'ren_balanced')
@@ -248,6 +261,8 @@ def update_records(step_model, distributed, optimizer, records, dummy, a, rank, 
     horizon_sum = torch.zeros((2,2), device=device) if stable else None
     counts = torch.tensor([sum(len(r['positions']) for r in records),
                            sum(bool(r['positions']) for r in records)], device=device, dtype=torch.long)
+    if efficient(a):
+        synchronize()
     started = time.monotonic()
     denominator = weight_stats['loss_tokens'] if stable else expected
     if stable and not denominator:
@@ -269,7 +284,7 @@ def update_records(step_model, distributed, optimizer, records, dummy, a, rank, 
         batch = local[start:start+a.train_micro_batch_size]
         if any(r['snapshot_round'] != a.round for r in batch):
             raise RuntimeError('Stale Student rollout snapshot')
-        if a.method != 'opsd' and any(not r.get('teacher_scored') and not r.get('dummy') for r in batch):
+        if a.method != 'opsd' and needs_teacher(a) and any(not r.get('teacher_scored') and not r.get('dummy') for r in batch):
             raise RuntimeError('Missing Teacher target')
         last = start+a.train_micro_batch_size >= len(local)
         context = distributed.no_sync() if world > 1 and not last else contextlib.nullcontext()
@@ -325,6 +340,8 @@ def update_records(step_model, distributed, optimizer, records, dummy, a, rank, 
                     reasoning_objective_share=balanced/float(component_sum[0]) if component_sum[0]>0 else 0.)
             weight_stats['reasoning_mean_weighted_kl']=float(budget_sum[0])/max(weight_stats['reasoning_tokens'],1)
 
+    if efficient(a):
+        synchronize()
     return {'round': a.round, 'completed_updates': a.round+1, 'objective_loss': objective_value,
             'forward_kl': objective_value,  # legacy field name kept for older analysis scripts
             'grad_norm': grad.item(), 'reasoning_tokens': positions, 'supervised_trajectories': active,
@@ -438,6 +455,7 @@ def student_worker(a, rank, world, ids, port, conn):
                 conn.send({'op': 'head_ready', 'rank': rank})
             elif op == 'collect':
                 a.round = command['round']
+                a._cost_collection = dict(generation_seconds=0., generation_request_seconds=0., causal_scoring_seconds=0.)
                 optimizer.zero_grad(set_to_none=True)
                 if device.type == 'cuda':
                     torch.cuda.reset_peak_memory_stats(device)
@@ -462,6 +480,7 @@ def student_worker(a, rank, world, ids, port, conn):
                 if a.method in ('ren_resolved', 'ren_stable', 'ren_shared', 'ren_balanced'):
                     audit_rollouts(list(cache.values()), tok, a, rank)
                 conn.send({'op': 'collected', 'rank': rank, 'round': a.round,
+                           'phase_seconds': dict(a._cost_collection),
                            'seconds': time.monotonic()-started,
                            'response_tokens': sum(len(r['response_ids']) for r in cache.values())})
             elif op == 'validate':
@@ -647,7 +666,9 @@ def teacher_payload(records):
 def pipeline_round(a, workers, students, hindsight, teacher):
     started = time.monotonic()
     if hindsight:
-        if not a.lora_rank and a.rollout_backend == 'vllm':
+        if not needs_hindsight(a):
+            hindsight.send({'op': 'sync_checkpoint', 'round': a.round, 'checkpoint': ''})
+        elif not a.lora_rank and a.rollout_backend == 'vllm':
             from lulu.vllm_rollout import snapshot_path
             hindsight.send({'op': 'sync_checkpoint', 'round': a.round,
                             'checkpoint': snapshot_path(a.output_dir, a.round)})
@@ -676,6 +697,8 @@ def pipeline_round(a, workers, students, hindsight, teacher):
     scored_by = {}
     dummy = None
     response_tokens = 0
+    collection_phases = {}
+    service_phases = {'hindsight_forward_seconds': 0., 'reference_forward_seconds': 0.}
     service_seconds = {'hindsight': 0., 'teacher': 0.}
     service_counts = {'hindsight': 0, 'teacher': 0}
     scoring_work = {'teacher_sequence_tokens': 0, 'hindsight_sequence_tokens': 0,
@@ -727,6 +750,7 @@ def pipeline_round(a, workers, students, hindsight, teacher):
             if message['op'] == 'collected':
                 collected.add(rank)
                 response_tokens += message['response_tokens']
+                collection_phases[rank] = message.get('phase_seconds', {})
                 progress('rollout_and_scoring')
             elif message['op'] == 'batch':
                 records = message['records']
@@ -770,6 +794,8 @@ def pipeline_round(a, workers, students, hindsight, teacher):
                 if is_h or not parallel_services:
                     r.pop('hindsight_prompt_ids', None)
             service_seconds['hindsight' if is_h else 'teacher'] += message.get('seconds', 0.)
+            for key, value in message.get('phase_seconds', {}).items():
+                service_phases[key] = service_phases.get(key, 0.) + value
             service_counts['hindsight' if is_h else 'teacher'] += len(records)
             progress('rollout_and_scoring')
             if parallel_services:
@@ -808,6 +834,7 @@ def pipeline_round(a, workers, students, hindsight, teacher):
     updated = set()
     metrics = None
     student_memory = []
+    update_phases = {}
     while len(updated) < len(students):
         conn, message = workers.receive([c for i, c in enumerate(students) if i not in updated])
         rank = students.index(conn)
@@ -815,6 +842,7 @@ def pipeline_round(a, workers, students, hindsight, teacher):
             raise RuntimeError('Unexpected update completion')
         updated.add(rank)
         worker_metrics = message['metrics']
+        update_phases[rank] = {key: worker_metrics[key] for key in ('update_seconds', 'weight_scoring_seconds', 'checkpoint_seconds') if key in worker_metrics}
         student_memory.append({
             'rank': rank,
             'peak_memory_allocated_mib': worker_metrics.get('student_peak_memory_allocated_mib'),
@@ -828,6 +856,11 @@ def pipeline_round(a, workers, students, hindsight, teacher):
                    teacher_seconds=service_seconds['teacher'], hindsight_seconds=service_seconds['hindsight'],
                    **scoring_work)
     metrics['student_memory_by_rank'] = sorted(student_memory, key=lambda row: row['rank'])
+    metrics['cost_phases'] = {'collection_by_rank': collection_phases,
+                             'collection': summarize_workers(list(collection_phases.values())),
+                             'update_by_rank': update_phases,
+                             'update': summarize_workers(list(update_phases.values())),
+                             'services': dict(service_phases, teacher_forward_seconds=service_seconds['teacher'])}
     metrics['student_peak_memory_allocated_mib'] = max(
         (row['peak_memory_allocated_mib'] for row in student_memory if row['peak_memory_allocated_mib'] is not None),
         default=None)
@@ -947,7 +980,7 @@ def run_persistent(a):
             metrics = pipeline_round(a, workers, students, hindsight, teacher)
             remaining = a.rounds-index-1
             metrics['remaining_seconds_at_last_round_rate'] = remaining*metrics['round_seconds']
-            if a.method in ('ren_stable', 'ren_shared', 'ren_balanced'):
+            if a.method in ('ren_stable', 'ren_shared', 'ren_balanced') and not efficient(a):
                 from lulu.stability import record_round
                 metrics['stability'] = record_round(root, index, metrics, a)
             tr.atomic_json(root/'metrics'/f'round_{index:04d}.json', [metrics])

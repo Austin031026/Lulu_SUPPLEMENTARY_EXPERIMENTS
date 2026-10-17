@@ -37,6 +37,7 @@ METHODS = ('ren_shared', 'ren_balanced', 'ren_stable', 'ren_resolved', 'ren_opd'
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--cost-mode', action='store_true', help='Matched ren/vanilla/opsd objectives with essential scoring only and synchronized phase timings')
     p.add_argument('--phase', choices=('run', 'init', 'collect', 'teacher', 'update'), default='run')
     p.add_argument('--backend', choices=('persistent', 'staged'), default='persistent',
                    help='Resident GPU roles and in-memory pipeline, or legacy subprocess phases')
@@ -112,6 +113,11 @@ def parser():
 
 
 def validate_args(a):
+    if getattr(a, 'cost_mode', False):
+        if a.method != 'ren_balanced' or a.backend != 'persistent' or a.reasoning_ablation not in ('ren', 'vanilla', 'opsd'):
+            raise ValueError('cost-mode requires persistent ren_balanced ren/vanilla/opsd')
+        if a.gradient_norm_every or a.gradient_cosines or a.reasoning_diagnostic_split or a.validation_every:
+            raise ValueError('cost-mode excludes optional gradient/position/validation diagnostics')
     if getattr(a, 'optimizer_state_sharding', False) and (a.backend != 'persistent' or a.lora_rank != 0):
         raise ValueError('Optimizer state sharding requires persistent full-parameter training')
     if getattr(a, 'rollout_vllm_sleep', False) and a.rollout_backend != 'vllm':

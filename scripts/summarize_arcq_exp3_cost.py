@@ -6,6 +6,8 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import math
+from arcq_cost_validation import validate_training, verify_evaluation, validate_telemetry, compare_runs, number, digest
 
 
 EXPECTED_LABELS = ("vanilla_opd", "hind", "opsd")
@@ -81,6 +83,17 @@ def read_run(label: str, root: Path, evaluation_model: str | None = None) -> dic
         raise FileNotFoundError("missing required Experiment 3 outputs:\n" + "\n".join(missing))
 
     telemetry = load_json(telemetry_path)
+    config, checkpoint = validate_training(label, root, metrics, telemetry)
+    suite = root.parent.parent
+    frozen_plan = load_json(suite/'experiment_plan.json')
+    source_hashes = {str(Path(p).relative_to(suite/'code')): expected for p, expected in frozen_plan['sha256'].items() if Path(p).is_relative_to(suite/'code')}
+    if not source_hashes:
+        raise ValueError('Frozen source inventory missing')
+    for path, expected in frozen_plan['sha256'].items():
+        if digest(path) != expected:
+            raise ValueError(f'Frozen artifact changed: {path}')
+    if telemetry['command'] != frozen_plan['commands'][label]['train']:
+        raise ValueError('Training command differs from frozen suite')
     if telemetry.get("status") != "complete" or telemetry.get("exit_code") != 0:
         raise ValueError(f"telemetry marks {label} as incomplete")
     evaluation = load_json(evaluation_path)
@@ -97,7 +110,12 @@ def read_run(label: str, root: Path, evaluation_model: str | None = None) -> dic
         if not isinstance(accuracy, (int, float)):
             raise ValueError(f"{selected_name}/{name} has no numerical accuracy")
         accuracies[name] = float(accuracy)
+        number(accuracy, name, maximum=1)
+    raw_accuracy, identity, protocol = verify_evaluation(root, selected_name, checkpoint)
+    if any(not math.isclose(raw_accuracy[name], accuracies[name], abs_tol=1e-12, rel_tol=0) for name in accuracies):
+        raise ValueError('Raw rewards and summary accuracy disagree')
     macro = selected.get("macro_accuracy")
+    number(macro, 'macro_accuracy', maximum=1)
     recomputed_macro = sum(accuracies.values()) / len(accuracies)
     if macro is None:
         macro = recomputed_macro
@@ -112,6 +130,28 @@ def read_run(label: str, root: Path, evaluation_model: str | None = None) -> dic
     round_seconds = sum(float(row.get("round_seconds", 0)) for row in metrics)
     teacher_seconds = sum(float(row.get("teacher_seconds", 0)) for row in metrics)
     hindsight_seconds = sum(float(row.get("hindsight_seconds", 0)) for row in metrics)
+    eval_telemetry = load_json(root/'evaluation_telemetry/summary.json')
+    validate_telemetry(eval_telemetry, 'evaluation')
+    if eval_telemetry.get('command') != frozen_plan['commands'][label]['evaluation']:
+        raise ValueError('Evaluation command differs from frozen suite')
+    phases = {}
+    for row in metrics:
+        for group in ('collection', 'update'):
+            for name, values in row['cost_phases'][group].items():
+                for reduction, seconds in values.items():
+                    key = f'{name}_{reduction}'
+                    phases[key] = phases.get(key, 0.) + number(seconds, key)
+        for name, seconds in row['cost_phases']['services'].items():
+            phases[name] = phases.get(name, 0.) + number(seconds, name)
+    comparison_keys = ('model','teacher_model','train_sha256','rounds','global_batch_prompts','rollouts_per_prompt',
+                       'seed','learning_rate','weight_decay','max_grad_norm','max_new_tokens','max_prompt_tokens',
+                       'max_sequence_tokens','temperature','top_p','rollout_top_k','rollout_backend','student_gpus',
+                       'control_loss_coef','reference_kl_coef','dtype','master_weights_fp32','optimizer_state_sharding',
+                       'rollout_vllm_sleep','rollout_vllm_memory','rollout_vllm_max_seqs','rollout_batch_size',
+                       'score_batch_size','train_micro_batch_size','logit_chunk_size','match_causal_update','update_passes')
+    for key in comparison_keys:
+        if key not in config:
+            raise ValueError(f'Missing scientific configuration: {key}')
     allocator_allocated = max(
         (float(row["student_peak_memory_allocated_mib"]) for row in metrics
          if row.get("student_peak_memory_allocated_mib") is not None),
@@ -124,6 +164,16 @@ def read_run(label: str, root: Path, evaluation_model: str | None = None) -> dic
     )
     return {
         "label": label,
+        "source_sha256": source_hashes,
+        "comparison_config": {k: config[k] for k in comparison_keys},
+        "hardware": sorted((g['name'], g['memory_total_mib']) for g in telemetry['gpus'].values()),
+        "evaluation_identity": identity,
+        "evaluation_protocol": protocol,
+        "phase_seconds": phases,
+        "startup_seconds": number(load_json(root/'train/runtime_plan.json').get('startup_seconds'), 'startup_seconds'),
+        "snapshot_sync_seconds": sum(number(row.get('snapshot_sync_seconds'), 'snapshot_sync_seconds') for row in metrics),
+        "evaluation_gpu_hours": eval_telemetry['gpu_hours'],
+        "train_plus_evaluation_gpu_hours": telemetry['gpu_hours']+eval_telemetry['gpu_hours'],
         "run_root": str(root),
         "completed_rounds": len(metrics),
         "generated_tokens": generated_tokens,
@@ -154,6 +204,8 @@ def write_tsv(path: Path, rows: list[dict]) -> None:
         "wall_seconds", "gpu_count", "gpu_hours",
         "peak_device_memory_used_mib", "sampled_gpu_energy_wh", "macro_accuracy",
         "student_peak_memory_allocated_mib", "student_peak_memory_reserved_mib",
+        "evaluation_gpu_hours", "train_plus_evaluation_gpu_hours", "relative_opd_cost",
+        "accuracy_gain_pp", "gpu_hours_per_million_tokens",
     ]
     with path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, delimiter="\t", extrasaction="ignore")
@@ -168,8 +220,11 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
         "`rollout_and_scoring_seconds` is the measured collection and target-scoring pipeline, not pure generation time.",
         "Peak memory is sampled total device memory, including PyTorch, vLLM, NCCL, and other processes on the allocated GPU.",
         "",
-        "| Algorithm | GPU-hours | Wall hours | Generated tokens | Rollout + scoring hours | Update hours | Device peak MiB | Student allocated MiB | Student reserved MiB | Macro accuracy |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "GPU-hours charge all eight reserved GPUs, including idle slots. Training includes startup and checkpoint I/O; evaluation is charged separately. Smoke tests are excluded from the main comparison.",
+        "Phase service times overlap and must not be added as a wall-clock breakdown. Stage-level means are not repeated-run confidence intervals.",
+        "",
+        "| Algorithm | Train GPU-hours | Cost / OPD | Eval GPU-hours | Wall hours | Generated tokens | Device peak MiB | Macro accuracy | Gain vs OPD (pp) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         macro = "" if row["macro_accuracy"] is None else f'{100*row["macro_accuracy"]:.2f}%'
@@ -177,9 +232,9 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
         allocated = "" if row["student_peak_memory_allocated_mib"] is None else f'{row["student_peak_memory_allocated_mib"]:.0f}'
         reserved = "" if row["student_peak_memory_reserved_mib"] is None else f'{row["student_peak_memory_reserved_mib"]:.0f}'
         lines.append(
-            f'| {row["label"]} | {row["gpu_hours"]:.3f} | {row["wall_seconds"]/3600:.3f} | '
-            f'{row["generated_tokens"]} | {row["rollout_and_scoring_seconds"]/3600:.3f} | '
-            f'{row["update_seconds"]/3600:.3f} | {peak} | {allocated} | {reserved} | {macro} |'
+            f'| {row["label"]} | {row["gpu_hours"]:.3f} | {row["relative_opd_cost"]:.3f} | '
+            f'{row["evaluation_gpu_hours"]:.3f} | {row["wall_seconds"]/3600:.3f} | '
+            f'{row["generated_tokens"]} | {peak} | {macro} | {row["accuracy_gain_pp"]:+.2f} |'
         )
     path.write_text("\n".join(lines) + "\n")
 
@@ -206,6 +261,7 @@ def main() -> None:
             raise ValueError(f"invalid --evaluation-model {value!r}")
         selected_models[label] = model
     rows = [read_run(label, parsed[label], selected_models.get(label)) for label in EXPECTED_LABELS]
+    compare_runs(rows)
     payload = {
         "schema_version": 1,
         "scope": "same-hardware ArcQ Experiment 3 cost comparison",
@@ -214,6 +270,16 @@ def main() -> None:
     (output / "summary.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     write_tsv(output / "summary.tsv", rows)
     write_markdown(output / "REPORT.md", rows)
+    with (output/'phase_seconds.tsv').open('w', newline='') as stream:
+        writer = csv.writer(stream, delimiter='\t')
+        writer.writerow(['algorithm','measurement','seconds'])
+        for row in rows:
+            writer.writerows((row['label'], key, value) for key, value in row['phase_seconds'].items())
+    with (output/'benchmark_accuracy.tsv').open('w', newline='') as stream:
+        writer = csv.writer(stream, delimiter='\t')
+        writer.writerow(['algorithm','benchmark','accuracy'])
+        for row in rows:
+            writer.writerows((row['label'], name, value) for name, value in row['benchmark_accuracy'].items())
     print(json.dumps({"status": "complete", "output_dir": str(output)}, ensure_ascii=False))
 
 

@@ -9,6 +9,7 @@ is preserved, so launchers can treat it exactly like the original command.
 from __future__ import annotations
 
 import argparse
+import contextlib
 from datetime import datetime, timezone
 import json
 import os
@@ -76,7 +77,7 @@ def query_gpus(devices: list[str]) -> list[dict]:
         "-i",
         ",".join(devices),
     ]
-    output = subprocess.run(command, check=True, capture_output=True, text=True).stdout
+    output = subprocess.run(command, check=True, capture_output=True, text=True, timeout=15).stdout
     rows = []
     for line in output.splitlines():
         values = [item.strip() for item in line.split(",")]
@@ -100,11 +101,12 @@ def query_gpus(devices: list[str]) -> list[dict]:
 
 
 def summarize(samples: list[dict], *, label: str, command: list[str], gpus: list[str],
-              started_unix: float, finished_unix: float, exit_code: int) -> dict:
+              started_unix: float, finished_unix: float, exit_code: int,
+              elapsed_seconds: float | None = None) -> dict:
     by_gpu = {gpu: [] for gpu in gpus}
     for sample in samples:
         for row in sample["gpus"]:
-            by_gpu[row["index"]].append((sample["unix"], row))
+            by_gpu[row["index"]].append((sample.get("monotonic", sample["unix"]), row))
 
     gpu_rows = {}
     total_energy_wh = 0.0
@@ -126,11 +128,11 @@ def summarize(samples: list[dict], *, label: str, command: list[str], gpus: list
             "peak_utilization_percent": max(row["utilization_percent"] for row in rows),
             "mean_utilization_percent": sum(row["utilization_percent"] for row in rows) / len(rows),
             "peak_power_watts": max((row["power_watts"] for row in rows if row["power_watts"] is not None), default=None),
-            "estimated_energy_wh": energy_wh if len(observations) > 1 else None,
+            "estimated_energy_wh": energy_wh if len(observations) > 1 and all(row['power_watts'] is not None for row in rows) else None,
             "samples": len(rows),
         }
 
-    wall_seconds = finished_unix - started_unix
+    wall_seconds = finished_unix - started_unix if elapsed_seconds is None else elapsed_seconds
     return {
         "schema_version": 1,
         "label": label,
@@ -143,7 +145,7 @@ def summarize(samples: list[dict], *, label: str, command: list[str], gpus: list
         "allocated_gpu_count": len(gpus),
         "gpu_hours": wall_seconds * len(gpus) / 3600,
         "sample_count": len(samples),
-        "sampled_gpu_energy_wh": total_energy_wh if len(samples) > 1 else None,
+        "sampled_gpu_energy_wh": total_energy_wh if gpu_rows and all(row['estimated_energy_wh'] is not None for row in gpu_rows.values()) else None,
         "gpus": gpu_rows,
         "peak_device_memory_used_mib": max(
             (row["peak_device_memory_used_mib"] for row in gpu_rows.values()), default=None
@@ -166,6 +168,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--label", required=True)
     parser.add_argument("--gpus", required=True)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
+    parser.add_argument("--scope", choices=('train', 'evaluation', 'smoke'), default='train')
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.command and args.command[0] == "--":
@@ -200,30 +203,59 @@ def main() -> int:
         "cwd": os.getcwd(),
         "git": git_provenance(os.getcwd()),
         "initial_gpu_state": initial,
+        "scope": args.scope,
     }
     atomic_json(manifest_path, manifest)
 
-    child = subprocess.Popen(args.command)
+    started_monotonic = time.monotonic()
+    child = subprocess.Popen(args.command, start_new_session=True)
+    interrupted = []
 
     def forward(signum, _frame):
+        interrupted.append(signum)
         if child.poll() is None:
-            child.send_signal(signum)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signum)
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, forward)
 
-    samples = []
-    with samples_path.open("x", encoding="utf-8") as stream:
-        while True:
-            sample = {"unix": time.time(), "utc": utc_now(), "gpus": query_gpus(devices)}
-            samples.append(sample)
-            stream.write(json.dumps(sample, ensure_ascii=False) + "\n")
-            stream.flush()
-            exit_code = child.poll()
-            if exit_code is not None:
-                break
-            time.sleep(args.poll_seconds)
-
+    samples, errors = [], []
+    exit_code = 1
+    try:
+        with samples_path.open("x", encoding="utf-8") as stream:
+            while True:
+                if interrupted:
+                    raise InterruptedError(f'interrupted: {interrupted[-1]}')
+                stamp = dict(unix=time.time(), monotonic=time.monotonic(), utc=utc_now())
+                try:
+                    sample = dict(stamp, gpus=query_gpus(devices))
+                    samples.append(sample)
+                    stream.write(json.dumps(sample) + '\n')
+                except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+                    error = dict(stamp, error=str(exc))
+                    errors.append(error)
+                    stream.write(json.dumps(error) + '\n')
+                stream.flush()
+                try:
+                    exit_code = child.wait(timeout=args.poll_seconds)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+    except BaseException as exc:
+        errors.append({'error': repr(exc), 'unix': time.time()})
+    finally:
+        # Clean the complete owned process group, including orphan workers.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGTERM)
+        try:
+            child.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            pass
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+    elapsed_seconds = time.monotonic()-started_monotonic
     finished_unix = time.time()
     summary = summarize(
         samples,
@@ -233,12 +265,18 @@ def main() -> int:
         started_unix=started_unix,
         finished_unix=finished_unix,
         exit_code=exit_code,
+        elapsed_seconds=elapsed_seconds,
     )
     summary["started_utc"] = manifest["started_utc"]
     summary["finished_utc"] = utc_now()
+    summary.update(scope=args.scope, sampling_errors=errors, git=manifest['git'],
+                   monitoring_complete=bool(samples) and not errors and not interrupted,
+                   poll_seconds=args.poll_seconds)
+    if not summary['monitoring_complete']:
+        summary['status'] = 'incomplete'
     atomic_json(summary_path, summary)
     print(json.dumps({"telemetry": str(summary_path), "exit_code": exit_code}), flush=True)
-    return exit_code
+    return exit_code if exit_code else (0 if summary['monitoring_complete'] else 2)
 
 
 if __name__ == "__main__":

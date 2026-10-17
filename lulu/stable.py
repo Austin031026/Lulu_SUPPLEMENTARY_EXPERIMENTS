@@ -66,6 +66,9 @@ def reference_reverse_kl(student_logits, reference_logits):
 def prepare_weights(step, records, a, rank, world):
     """Score ReN once, apply the requested allocation control, and persist RQ diagnostics."""
     from lulu import training as tr
+    if getattr(a, 'cost_mode', False):
+        from lulu.cost_weights import prepare_cost_weights
+        return prepare_cost_weights(step, records, a, rank, world)
     from lulu.allocation import allocate_reasoning_weights, allocation_invariants
     if a.method == 'ren_shared':
         from lulu.shared import prepare_shared
@@ -326,7 +329,7 @@ def stable_forward(step, records):
             stop=min(n,start+a.logit_chunk_size)
             if mode == 3 and start >= split: continue
             if mode == 4 and stop <= split: continue
-            th=record['teacher_hidden'][start:stop].to(live.device)
+            th=record.get('teacher_hidden', record['reference_hidden'])[start:stop].to(live.device)
             rh=record['reference_hidden'][start:stop].to(live.device)
             rho=(torch.ones(stop-start,device=live.device) if shared else record['stable_rho'][start:stop].to(live.device))
             ch=record['student_hidden'][start:stop].to(live.device) if shared else th[:,:0]
@@ -341,7 +344,7 @@ def stable_forward(step, records):
                 ren, control, ref, early_ren, late_ren = zero, zero, zero, zero, zero
                 if mode in (None, 0, 1, 3, 4):
                     with torch.no_grad():
-                        teacher_target=step.teacher_head(teacher_states).float().softmax(-1)
+                        teacher_target=(None if opsd and getattr(a, 'cost_mode', False) else step.teacher_head(teacher_states).float().softmax(-1))
                         distill_target=(step.frozen_head(hindsight_states).float().softmax(-1) if opsd else teacher_target)
                     if mode in (None, 1) or not shared:
                         kd=forward_kl(student_logits,distill_target,reduction='none')

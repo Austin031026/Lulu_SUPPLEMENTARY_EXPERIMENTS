@@ -15,6 +15,7 @@ from collections.abc import Mapping
 import torch
 
 from lulu.training import base_model, disable_dropout, load_student, load_tokenizer, selected_hidden
+from lulu.cost import efficient, needs_hindsight, measured
 
 
 def sync_snapshot(model, state, expected_names):
@@ -59,6 +60,8 @@ def score_hindsight(model, tok, records, a):
     """Return sparse H\\C IDs (or H hidden states for the OPSD control)."""
     if not records:
         return []
+    if not needs_hindsight(a):
+        return [{} for _ in records]
     if a.method not in ('ren_shared', 'ren_balanced', 'ren_stable', 'ren_resolved', 'ren_opd', 'ren_graft', 'union_topk', 'causal_topk', 'opsd', 'vanilla_opd'):
         raise ValueError(f'Unsupported hindsight method: {a.method}')
     head = base_model(model).get_output_embeddings()
@@ -132,13 +135,16 @@ def hindsight_worker(a, device_ids, conn):
         if a.lora_rank and not initial_checkpoint:
             raise ValueError('A LoRA privileged Student needs the initial Student checkpoint')
         tok = load_tokenizer(a.model)
-        model = load_student(a, checkpoint_dir=Path(initial_checkpoint) if initial_checkpoint else None,
-                             trainable=True)
-        expected_names = tuple(name for name, parameter in model.named_parameters() if parameter.requires_grad)
-        if hasattr(model, 'gradient_checkpointing_disable'):
-            model.gradient_checkpointing_disable()
-        disable_dropout(model)
-        model.requires_grad_(False).eval()
+        model = None
+        expected_names = ()
+        if needs_hindsight(a):
+            model = load_student(a, checkpoint_dir=Path(initial_checkpoint) if initial_checkpoint else None,
+                                 trainable=True)
+            expected_names = tuple(name for name, parameter in model.named_parameters() if parameter.requires_grad)
+            if hasattr(model, 'gradient_checkpointing_disable'):
+                model.gradient_checkpointing_disable()
+            disable_dropout(model)
+            model.requires_grad_(False).eval()
         reference = None
         ready = {'op': 'ready', 'role': 'hindsight', 'sync_names': expected_names}
         if a.method in ('ren_stable', 'ren_shared', 'ren_balanced'):
@@ -165,7 +171,9 @@ def hindsight_worker(a, device_ids, conn):
                 if synchronized_round is not None and round_index < synchronized_round:
                     raise ValueError('Cannot synchronize an older Student snapshot')
                 started = time.monotonic()
-                if operation == 'sync_checkpoint':
+                if model is None:
+                    pass  # Vanilla uses only the frozen reference on this GPU.
+                elif operation == 'sync_checkpoint':
                     from lulu.weight_sync import sync_hindsight_checkpoint
                     sync_hindsight_checkpoint(model, request['checkpoint'], round_index)
                 else:
@@ -177,7 +185,16 @@ def hindsight_worker(a, device_ids, conn):
                 if synchronized_round is None or request['round'] != synchronized_round:
                     raise ValueError('Hindsight score must use the synchronized Student round')
                 started = time.monotonic()
-                result = score_hindsight(model, tok, request['records'], a)
+                phase_seconds = {'hindsight_forward_seconds': 0., 'reference_forward_seconds': 0.}
+                if efficient(a):
+                    if needs_hindsight(a):
+                        with measured(phase_seconds, 'hindsight_forward_seconds'):
+                            result = score_hindsight(model, tok, request['records'], a)
+                    else:
+                        result = [{} for _ in request['records']]
+                else:
+                    result = score_hindsight(model, tok, request['records'], a)
+                reference_started = time.monotonic()
                 if reference is not None:
                     with torch.inference_mode():
                         for start in range(0, len(request['records']), a.score_batch_size):
@@ -185,8 +202,10 @@ def hindsight_worker(a, device_ids, conn):
                             states = selected_hidden(reference, tok, batch, 'causal_prompt_ids', a)
                             for offset, hidden in enumerate(states):
                                 result[start+offset]['reference_hidden'] = hidden.detach().cpu().clone()
+                phase_seconds['reference_forward_seconds'] = time.monotonic()-reference_started
                 conn.send({'op': 'scored', 'role': 'hindsight', 'round': synchronized_round,
                            'request_id': request['request_id'], 'records': result,
+                           'phase_seconds': phase_seconds,
                            'seconds': time.monotonic() - started})
             else:
                 raise ValueError(f'Unknown privileged Student operation: {operation}')
