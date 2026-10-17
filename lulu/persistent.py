@@ -439,6 +439,8 @@ def student_worker(a, rank, world, ids, port, conn):
             elif op == 'collect':
                 a.round = command['round']
                 optimizer.zero_grad(set_to_none=True)
+                if device.type == 'cuda':
+                    torch.cuda.reset_peak_memory_stats(device)
                 if getattr(a, 'rollout_vllm_sleep', False):
                     # Return update-time cached buffers before vLLM wakes on this GPU.
                     torch.cuda.empty_cache()
@@ -506,6 +508,9 @@ def student_worker(a, rank, world, ids, port, conn):
                     # before every rank rebuilds the collective DDP wrapper.
                     dist.barrier()
                     distributed = distributed_student(step_model, device, world)
+                if device.type == 'cuda':
+                    metrics['student_peak_memory_allocated_mib'] = torch.cuda.max_memory_allocated(device) / (1024**2)
+                    metrics['student_peak_memory_reserved_mib'] = torch.cuda.max_memory_reserved(device) / (1024**2)
                 conn.send({'op': 'updated', 'rank': rank, 'round': a.round, 'metrics': metrics})
             else:
                 raise ValueError(f'Unknown Student command: {op}')
@@ -802,19 +807,33 @@ def pipeline_round(a, workers, students, hindsight, teacher):
         conn.send({'op': 'update', 'round': a.round, 'records': targets[rank], 'dummy': dummy})
     updated = set()
     metrics = None
+    student_memory = []
     while len(updated) < len(students):
         conn, message = workers.receive([c for i, c in enumerate(students) if i not in updated])
         rank = students.index(conn)
         if message['op'] != 'updated' or message['round'] != a.round:
             raise RuntimeError('Unexpected update completion')
         updated.add(rank)
+        worker_metrics = message['metrics']
+        student_memory.append({
+            'rank': rank,
+            'peak_memory_allocated_mib': worker_metrics.get('student_peak_memory_allocated_mib'),
+            'peak_memory_reserved_mib': worker_metrics.get('student_peak_memory_reserved_mib'),
+        })
         if rank == 0:
-            metrics = message['metrics']
+            metrics = worker_metrics
     progress('round_complete')
     metrics.update(round_seconds=time.monotonic()-started, pipeline_seconds=pipeline_seconds,
                    snapshot_sync_seconds=sync_seconds, response_tokens=response_tokens,
                    teacher_seconds=service_seconds['teacher'], hindsight_seconds=service_seconds['hindsight'],
                    **scoring_work)
+    metrics['student_memory_by_rank'] = sorted(student_memory, key=lambda row: row['rank'])
+    metrics['student_peak_memory_allocated_mib'] = max(
+        (row['peak_memory_allocated_mib'] for row in student_memory if row['peak_memory_allocated_mib'] is not None),
+        default=None)
+    metrics['student_peak_memory_reserved_mib'] = max(
+        (row['peak_memory_reserved_mib'] for row in student_memory if row['peak_memory_reserved_mib'] is not None),
+        default=None)
     return metrics
 
 
