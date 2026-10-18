@@ -64,11 +64,18 @@ def deterministic_subset(rows: Sequence[Mapping], count: int, seed: int) -> list
         raise ValueError(f"--num-questions must be in [1, {len(rows)}], received {count}")
     identities = []
     for row in rows:
-        identity = str(row.get("id", ""))
+        raw_id = row.get("id")
+        raw_question_id = row.get("question_id")
+        if raw_id not in (None, "") and raw_question_id not in (None, ""):
+            if str(raw_id) != str(raw_question_id):
+                raise ValueError("Diagnostic id and question_id disagree")
+        identity = str(raw_id or raw_question_id or "").strip()
         if not identity:
-            raise ValueError("Every diagnostic question must have a nonempty id")
+            raise ValueError("Every diagnostic question must have a nonempty id or question_id")
+        normalized = dict(row)
+        normalized["id"] = identity
         key = hashlib.sha256(f"arcq-exp1:{seed}:{identity}".encode()).digest()
-        identities.append((key, identity, dict(row)))
+        identities.append((key, identity, normalized))
     if len({identity for _, identity, _ in identities}) != len(identities):
         raise ValueError("Diagnostic question ids must be unique")
     return [row for _, _, row in sorted(identities)[:count]]

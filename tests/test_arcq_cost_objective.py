@@ -15,7 +15,7 @@ def balanced_fixture(root):
     return a, model, records, step, opt
 
 
-@pytest.mark.parametrize('arm', ['ren', 'vanilla', 'opsd'])
+@pytest.mark.parametrize('arm', ['ren', 'low_kl_matched', 'entropy_matched', 'vanilla', 'opsd'])
 def test_cost_path_keeps_weights_loss_and_gradients(tmp_path, arm):
     torch.manual_seed(42)
     a, model, records, step, _ = balanced_fixture(tmp_path)

@@ -8,6 +8,8 @@ interpretable:
 * ``uniform``: preserve each rollout's total ReN mass, spread uniformly;
 * ``shuffled``: preserve the exact within-rollout multiset, permute positions;
 * ``causal_matched``: preserve the exact multiset, rank positions only by D_C;
+* ``low_kl_matched``: preserve the exact multiset, prefer smaller D_C;
+* ``entropy_matched``: preserve the exact multiset, prefer higher causal Student entropy;
 * ``vanilla``: weight every reasoning position by one;
 * ``none``: no reasoning Teacher loss.
 
@@ -20,7 +22,8 @@ import hashlib
 import torch
 
 
-ARMS = ("ren", "uniform", "shuffled", "causal_matched", "vanilla", "none", "opsd")
+ARMS = ("ren", "uniform", "shuffled", "causal_matched", "low_kl_matched",
+        "entropy_matched", "vanilla", "none", "opsd")
 
 
 def _seed(seed: int, round_index: int, source_id: object, record_index: int) -> int:
@@ -43,6 +46,7 @@ def allocate_reasoning_weights(
     causal_kl: torch.Tensor,
     reasoning_mask: torch.Tensor,
     *,
+    causal_entropy: torch.Tensor | None = None,
     arm: str,
     seed: int,
     round_index: int,
@@ -62,6 +66,11 @@ def allocate_reasoning_weights(
         raise ValueError("reasoning_mask must be boolean")
     if not torch.isfinite(base_weight).all() or not torch.isfinite(causal_kl).all():
         raise FloatingPointError("non-finite allocation inputs")
+    if arm == "entropy_matched":
+        if causal_entropy is None or causal_entropy.shape != base_weight.shape or causal_entropy.ndim != 1:
+            raise ValueError("entropy_matched requires causal_entropy with the same one-dimensional shape")
+        if not torch.isfinite(causal_entropy).all():
+            raise FloatingPointError("non-finite causal entropy")
     if bool((base_weight < 0).any()):
         raise ValueError("bounded ReN weights must be nonnegative")
 
@@ -83,8 +92,14 @@ def allocate_reasoning_weights(
         generator.manual_seed(_seed(seed, round_index, source_id, record_index))
         permutation = torch.randperm(values.numel(), generator=generator)
         result[positions] = values.cpu()[permutation].to(result.device)
-    elif arm == "causal_matched":
-        ranked_positions = _stable_descending(causal_kl[positions].to(torch.float64))
+    elif arm in ("causal_matched", "low_kl_matched", "entropy_matched"):
+        if arm == "entropy_matched":
+            priority = causal_entropy[positions]
+        elif arm == "low_kl_matched":
+            priority = -causal_kl[positions]
+        else:
+            priority = causal_kl[positions]
+        ranked_positions = _stable_descending(priority.to(torch.float64))
         ranked_weights = values[_stable_descending(values.to(torch.float64))]
         assigned = torch.empty_like(values)
         assigned[ranked_positions] = ranked_weights

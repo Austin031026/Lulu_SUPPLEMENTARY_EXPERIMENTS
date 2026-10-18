@@ -10,6 +10,7 @@ import torch.distributed as dist
 
 from lulu.objective import forward_kl
 from lulu.stable import bounded_absolute_weight, prompt_reasoning_scales
+from lulu.allocation import allocate_reasoning_weights, allocation_invariants
 
 
 @torch.no_grad()
@@ -26,6 +27,7 @@ def prepare_cost_weights(step, records, a, rank, world):
             raise ValueError('Cost mode requires full-response positions and masks')
         weights = torch.zeros(n)
         target_scores = torch.zeros(n)
+        causal_entropy = torch.zeros(n) if arm == 'entropy_matched' else None
         for start in range(0, n, a.logit_chunk_size):
             stop = min(n, start + a.logit_chunk_size)
             mask = torch.tensor(record['reasoning_mask'][start:stop], dtype=torch.bool, device=device)
@@ -37,19 +39,34 @@ def prepare_cost_weights(step, records, a, rank, world):
                     target = step.frozen_head(record['hindsight_hidden'][start:stop].to(device))[mask]
                 else:
                     target = step.teacher_head(record['teacher_hidden'][start:stop].to(device))[mask]
-                if arm == 'ren':
+                if arm in ('ren', 'low_kl_matched', 'entropy_matched'):
                     h = step.frozen_head(record['hindsight_hidden'][start:stop].to(device))[mask]
             dtype = torch.float64 if c.dtype == torch.float64 else torch.float32
             t_log = target.to(dtype).log_softmax(-1)
             c_log = c.to(dtype).log_softmax(-1)
             q = t_log.exp()
             dc = (q * (t_log-c_log)).sum(-1) if arm != 'opsd' else forward_kl(c, target.float().softmax(-1), reduction='none')
-            w = bounded_absolute_weight((q * (h.to(dtype).log_softmax(-1)-c_log)).sum(-1)) if arm == 'ren' else torch.ones_like(dc)
+            w = (bounded_absolute_weight((q * (h.to(dtype).log_softmax(-1)-c_log)).sum(-1))
+                 if arm in ('ren', 'low_kl_matched', 'entropy_matched') else torch.ones_like(dc))
             if not torch.isfinite(dc).all() or not torch.isfinite(w).all():
                 raise FloatingPointError('Non-finite cost-mode scores')
             cpu_mask = mask.cpu()
             weights[start:stop][cpu_mask] = w.cpu()
             target_scores[start:stop][cpu_mask] = dc.cpu()
+            if causal_entropy is not None:
+                entropy = -(c_log.exp() * c_log).sum(-1)
+                if not torch.isfinite(entropy).all():
+                    raise FloatingPointError('Non-finite causal Student entropy')
+                causal_entropy[start:stop][cpu_mask] = entropy.cpu()
+        if arm in ('low_kl_matched', 'entropy_matched'):
+            reasoning = torch.tensor(record['reasoning_mask'], dtype=torch.bool)
+            applied = allocate_reasoning_weights(
+                weights, target_scores, reasoning, causal_entropy=causal_entropy,
+                arm=arm, seed=a.seed, round_index=a.round,
+                source_id=record.get('source_id', record['index']), record_index=record['index'])
+            if not allocation_invariants(weights, applied, reasoning)['same_multiset']:
+                raise RuntimeError(f'{arm} changed the per-trajectory HinD weight multiset')
+            weights = applied
         record['stable_rho'] = weights
         record['scored_reasoning_kl_sum'] = float((weights.double() * target_scores.double()).sum())
         record.pop('student_hidden')

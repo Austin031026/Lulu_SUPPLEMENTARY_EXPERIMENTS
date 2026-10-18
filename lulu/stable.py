@@ -78,6 +78,8 @@ def prepare_weights(step, records, a, rank, world):
     arm = getattr(a, 'reasoning_ablation', 'ren')
     keys = ('causal_kl', 'hindsight_kl', 'resolved_mismatch', 'raw_weight', 'old_alpha',
             'bounded_weight', 'applied_weight', 'opsd_causal_kl', 'trajectory_index', 'position')
+    if arm == 'entropy_matched':
+        keys += ('causal_entropy',)
     pieces = {key: [] for key in keys}
     local_trajectories = []
     for record in records:
@@ -89,8 +91,11 @@ def prepare_weights(step, records, a, rank, world):
         reasoning = torch.tensor(record['reasoning_mask'], dtype=torch.bool)
         base_rho = torch.zeros(n, dtype=torch.float32)
         scored_dc = torch.zeros(n, dtype=torch.float32)
+        scored_entropy = torch.zeros(n, dtype=torch.float32) if arm == 'entropy_matched' else None
         scored_opsd = torch.zeros(n, dtype=torch.float32)
         per_record = {key: [] for key in ('causal_kl','hindsight_kl','resolved_mismatch','raw_weight','old_alpha','bounded_weight','opsd_causal_kl','position')}
+        if arm == 'entropy_matched':
+            per_record['causal_entropy'] = []
         for start in range(0, n, a.logit_chunk_size):
             stop = min(n, start+a.logit_chunk_size)
             keep = reasoning[start:stop]
@@ -109,6 +114,9 @@ def prepare_weights(step, records, a, rank, world):
                     h = step.frozen_head(record['hindsight_hidden'][start:stop][keep].to(device))
                     t = step.teacher_head(record['teacher_hidden'][start:stop][keep].to(device))
             scores = mismatch_scores(c, h, t, a.top_k)
+            if arm == 'entropy_matched':
+                c_log = c.float().log_softmax(-1)
+                scores['causal_entropy'] = -(c_log.exp() * c_log).sum(-1)
             scores['bounded_weight'] = (bounded_absolute_weight(scores['resolved_mismatch']) if a.method == 'ren_balanced'
                                         else bounded_weight(scores['causal_kl'], scores['resolved_mismatch'], a.stable_ratio_epsilon))
             # Matched-backbone OPSD uses the privileged Student as the direct target.
@@ -116,16 +124,18 @@ def prepare_weights(step, records, a, rank, world):
             h_target = h.float().softmax(-1)
             scores['opsd_causal_kl'] = forward_kl(c, h_target, reduction='none').detach()
             scored_dc[start:stop][keep] = scores['causal_kl'].cpu()
+            if scored_entropy is not None:
+                scored_entropy[start:stop][keep] = scores['causal_entropy'].cpu()
             scored_opsd[start:stop][keep] = scores['opsd_causal_kl'].cpu()
             base_rho[start:stop][keep] = scores['bounded_weight'].cpu()
             positions = np.arange(start,stop,dtype=np.int32)[keep.numpy()]
-            for key in ('causal_kl','hindsight_kl','resolved_mismatch','raw_weight','old_alpha','bounded_weight','opsd_causal_kl'):
+            for key in ('causal_kl','hindsight_kl','resolved_mismatch','raw_weight','old_alpha','bounded_weight','opsd_causal_kl') + (('causal_entropy',) if arm == 'entropy_matched' else ()):
                 values = scores[key].cpu().numpy()
                 pieces[key].append(values); per_record[key].append(values)
             pieces['position'].append(positions); per_record['position'].append(positions)
             pieces['trajectory_index'].append(np.full(len(positions),record['index'],dtype=np.int32))
 
-        applied = allocate_reasoning_weights(base_rho, scored_dc, reasoning, arm=arm,
+        applied = allocate_reasoning_weights(base_rho, scored_dc, reasoning, causal_entropy=scored_entropy, arm=arm,
             seed=a.seed, round_index=a.round, source_id=record.get('source_id', record['index']), record_index=record['index'])
         record['stable_rho'] = applied
         target_kl = scored_opsd if arm == 'opsd' else scored_dc
@@ -133,6 +143,8 @@ def prepare_weights(step, records, a, rank, world):
         selected = reasoning.numpy()
         pieces['applied_weight'].append(applied[reasoning].cpu().numpy())
         invariant = allocation_invariants(base_rho, applied, reasoning)
+        if arm in ('low_kl_matched', 'entropy_matched') and not invariant['same_multiset']:
+            raise RuntimeError(f'{arm} changed the per-trajectory HinD weight multiset')
         causal_selected = scored_dc[reasoning].double()
         applied_selected = applied[reasoning].double()
         base_selected = base_rho[reasoning].double()

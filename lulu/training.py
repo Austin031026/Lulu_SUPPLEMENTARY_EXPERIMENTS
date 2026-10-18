@@ -60,7 +60,7 @@ def parser():
     p.add_argument('--stable-ratio-epsilon', type=float, default=1e-6)
     p.add_argument('--gradient-norm-every', type=int, default=0, help='Exact full-batch component gradient norms every N updates, plus the first')
     p.add_argument('--gradient-cosines', action='store_true', help='Exact pairwise component gradient cosines; rank0 CPU gradient archive')
-    p.add_argument('--reasoning-ablation', choices=('ren','uniform','shuffled','causal_matched','vanilla','none','opsd'), default='ren', help='Balanced backbone allocation: ReN; budget-matched uniform/shuffled/causal controls; vanilla; control/reference only; or direct hindsight OPSD')
+    p.add_argument('--reasoning-ablation', choices=('ren','uniform','shuffled','causal_matched','low_kl_matched','entropy_matched','vanilla','none','opsd'), default='ren', help='Balanced backbone allocation: ReN; matched uniform/shuffled/causal/low-KL/entropy controls; vanilla; control/reference only; or direct hindsight OPSD')
     p.add_argument('--reasoning-diagnostic-split', type=int, default=0, help='Absolute response-position boundary for reasoning statistics and gradient contributions; 0 disables')
     p.add_argument('--validation-data', help='Frozen disjoint prepared dev JSONL; never used for training')
     p.add_argument('--validation-every', type=int, default=0, help='Resident greedy validation at round0 and every N completed rounds')
@@ -114,8 +114,8 @@ def parser():
 
 def validate_args(a):
     if getattr(a, 'cost_mode', False):
-        if a.method != 'ren_balanced' or a.backend != 'persistent' or a.reasoning_ablation not in ('ren', 'vanilla', 'opsd'):
-            raise ValueError('cost-mode requires persistent ren_balanced ren/vanilla/opsd')
+        if a.method != 'ren_balanced' or a.backend != 'persistent' or a.reasoning_ablation not in ('ren', 'low_kl_matched', 'entropy_matched', 'vanilla', 'opsd'):
+            raise ValueError('cost-mode requires persistent ren_balanced ren/low_kl_matched/entropy_matched/vanilla/opsd')
         if a.gradient_norm_every or a.gradient_cosines or a.reasoning_diagnostic_split or a.validation_every:
             raise ValueError('cost-mode excludes optional gradient/position/validation diagnostics')
     if getattr(a, 'optimizer_state_sharding', False) and (a.backend != 'persistent' or a.lora_rank != 0):

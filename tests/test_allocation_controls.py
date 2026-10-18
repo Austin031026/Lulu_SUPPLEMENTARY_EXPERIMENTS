@@ -31,6 +31,28 @@ def test_causal_matched_assigns_largest_weight_to_largest_causal_gap():
     torch.testing.assert_close(torch.sort(out).values,torch.sort(base).values)
 
 
+def test_low_kl_matched_prioritizes_smallest_gap_and_preserves_sparse_weights():
+    base=torch.tensor([0.4,0.,0.1,0.3,0.2])
+    dc=torch.tensor([3.,9.,1.,4.,2.])
+    mask=torch.tensor([1,0,1,1,1],dtype=torch.bool)
+    out=allocate_reasoning_weights(base,dc,mask,arm='low_kl_matched',seed=0,
+        round_index=0,source_id='p',record_index=0)
+    torch.testing.assert_close(out,torch.tensor([0.2,0.,0.4,0.1,0.3]))
+    torch.testing.assert_close(torch.sort(out[mask]).values,torch.sort(base[mask]).values)
+
+
+def test_entropy_matched_prioritizes_high_student_entropy_and_preserves_zeros():
+    base=torch.tensor([0.4,0.,0.1,0.3,0.])
+    dc=torch.tensor([3.,9.,1.,4.,2.])
+    entropy=torch.tensor([0.1,99.,0.9,0.5,0.7])
+    mask=torch.tensor([1,0,1,1,1],dtype=torch.bool)
+    out=allocate_reasoning_weights(base,dc,mask,causal_entropy=entropy,
+        arm='entropy_matched',seed=0,round_index=0,source_id='p',record_index=0)
+    torch.testing.assert_close(out,torch.tensor([0.,0.,0.4,0.1,0.3]))
+    torch.testing.assert_close(torch.sort(out[mask]).values,torch.sort(base[mask]).values)
+    assert out[~mask].count_nonzero()==0
+
+
 def test_none_vanilla_opsd_behave_as_expected():
     base=torch.tensor([0.1,0.2,0.3])
     dc=torch.ones(3)
