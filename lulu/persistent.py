@@ -56,7 +56,14 @@ def allocate_roles(a):
                 raise ValueError(f'Invalid {role} GPU IDs; must be unique members of --gpus')
             selected[role] = ids
     used = [x for ids in selected.values() if ids for x in ids]
-    if len(used) != len(set(used)):
+    collocate = bool(getattr(a, 'collocate_hindsight_student', False))
+    if collocate:
+        if (a.method != 'ren_balanced' or len(selected.get('student') or []) != 1
+                or selected.get('hindsight') != selected.get('student')
+                or len(selected.get('teacher') or []) != 1
+                or set(selected['teacher']) & set(selected['student'])):
+            raise ValueError('Collocation requires one shared Student/HinD GPU and one disjoint Teacher GPU for ren_balanced')
+    elif len(used) != len(set(used)):
         raise ValueError('Student, hindsight and Teacher GPU groups must be disjoint')
     free = [x for x in available if x not in used]
     for role, count in [('teacher', a.teacher_gpus_per_worker), ('hindsight', 1)]:
@@ -668,7 +675,8 @@ def pipeline_round(a, workers, students, hindsight, teacher):
     if hindsight:
         if not needs_hindsight(a):
             hindsight.send({'op': 'sync_checkpoint', 'round': a.round, 'checkpoint': ''})
-        elif not a.lora_rank and a.rollout_backend == 'vllm':
+        elif not a.lora_rank and (a.rollout_backend == 'vllm' or
+                                  getattr(a, 'collocate_hindsight_student', False)):
             from lulu.vllm_rollout import snapshot_path
             hindsight.send({'op': 'sync_checkpoint', 'round': a.round,
                             'checkpoint': snapshot_path(a.output_dir, a.round)})
@@ -724,7 +732,9 @@ def pipeline_round(a, workers, students, hindsight, teacher):
                 dummy['response_ids'] = dummy['response_ids'][:1]
                 dummy.update(positions=[], snapshot_round=a.round, dummy=True)
     while len(collected) < len(students) or pending_h or pending_t or busy_h or busy_t:
-        if hindsight and busy_h is None and pending_h:
+        if hindsight and busy_h is None and pending_h and (
+                not getattr(a, 'collocate_hindsight_student', False)
+                or len(collected) == len(students)):
             busy_h = pending_h.popleft()
             rank, records = busy_h
             hindsight.send({'op': 'score', 'round': a.round, 'request_id': records[0]['index'],
@@ -888,7 +898,9 @@ def run_persistent(a):
                                'max_sequence_tokens': a.max_sequence_tokens},
             'batches': {'rollout_per_student': a.rollout_batch_size,
                         'score': a.score_batch_size, 'train_micro': a.train_micro_batch_size},
-            'pipeline': ('Student rollout/causal -> parallel hindsight and answer-blind Teacher -> joined targets -> DDP update'
+            'pipeline': ('Student rollout/causal -> collocated hindsight and separate Teacher -> joined targets -> Student update'
+                         if getattr(a, 'collocate_hindsight_student', False) else
+                         'Student rollout/causal -> parallel hindsight and answer-blind Teacher -> joined targets -> DDP update'
                          if a.method in ('ren_opd', 'ren_resolved', 'ren_stable', 'ren_shared', 'ren_balanced') else
                          'Student rollout/causal -> synchronized hindsight -> answer-blind Teacher; then DDP update'),
             'rollout_backend': a.rollout_backend,

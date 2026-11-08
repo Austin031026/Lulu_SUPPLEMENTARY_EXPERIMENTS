@@ -35,6 +35,19 @@ def test_explicit_role_allocation_preserves_visible_gpu_ids_and_disjointness():
     assert len({gpu for group in roles.values() for gpu in group}) == 8
 
 
+def test_two_gpu_hind_collocation_requires_explicit_flag_and_disjoint_teacher():
+    args = _args(method='ren_balanced', gpus='0,1', student_gpus='0',
+                 hindsight_gpus='0', teacher_gpus='1', teacher_gpus_per_worker=1)
+    with pytest.raises(ValueError, match='disjoint'):
+        persistent.allocate_roles(args)
+    args.collocate_hindsight_student = True
+    assert persistent.allocate_roles(args) == {
+        'student': ['0'], 'hindsight': ['0'], 'teacher': ['1']}
+    args.teacher_gpus = '0'
+    with pytest.raises(ValueError, match='Collocation requires'):
+        persistent.allocate_roles(args)
+
+
 @pytest.mark.parametrize('options, message', [
     ({'student_gpus': '0,1', 'hindsight_gpus': '1', 'teacher_gpus': '6,7'}, 'disjoint'),
     ({'student_gpus': '0,0'}, 'Invalid student GPU'),
@@ -96,8 +109,9 @@ class _PipelineHarness:
         self.events.append(('send', conn.role, op, conn.rank))
         if op == 'snapshot':
             self._queue(conn, {'op': 'snapshot', 'round': version, 'state': {'adapter': torch.tensor([version])}})
-        elif op == 'sync':
-            assert message['state']['adapter'].item() == version
+        elif op in ('sync', 'sync_checkpoint'):
+            if op == 'sync':
+                assert message['state']['adapter'].item() == version
             self._queue(conn, {'op': 'synced', 'round': version})
         elif op == 'collect':
             records = [{'index': index, 'causal_prompt_ids': [3, 4],
@@ -109,7 +123,7 @@ class _PipelineHarness:
         elif op == 'score':
             if conn.role == 'teacher':
                 sanitize_score_request(message, self.method, vocab_size=31)
-                if self.method in ('ren_opd', 'ren_resolved'):
+                if self.method in ('ren_opd', 'ren_resolved', 'ren_balanced'):
                     result = [{'teacher_hidden': torch.ones(len(record['positions']), 16),
                                'teacher_scored': True}
                               for record in message['records']]
@@ -117,8 +131,10 @@ class _PipelineHarness:
                     result = [{'teacher_probs': torch.full_like(record['correction_ids'], .02, dtype=torch.float32),
                                'teacher_scored': True}
                               for record in message['records']]
-            elif self.method == 'ren_resolved':
-                result = [{'hindsight_hidden': torch.ones(len(record['positions']), 16)} for record in message['records']]
+            elif self.method in ('ren_resolved', 'ren_balanced'):
+                result = [{'hindsight_hidden': torch.ones(len(record['positions']), 16),
+                           'reference_hidden': torch.ones(len(record['positions']), 16)}
+                          for record in message['records']]
             elif self.method == 'opsd':
                 result = [{'student_hidden': torch.ones(len(record['positions']), 16)} for record in message['records']]
             elif self.method == 'ren_opd':
@@ -177,6 +193,21 @@ def test_round_synchronizes_h_before_rollout_overlaps_scoring_and_waits_for_all_
         teacher_start = workers.events.index(('send', 'teacher', 'score', None))
         h_finished = max(i for i, event in enumerate(workers.events) if event[:3] == ('receive', 'hindsight', 'scored'))
         assert teacher_start < h_finished
+
+
+def test_collocated_hind_waits_for_student_collection_before_privileged_forward(monkeypatch):
+    from lulu import vllm_rollout
+    monkeypatch.setattr(vllm_rollout, 'snapshot_path', lambda output_dir, round_index: '/checkpoint')
+    workers = _PipelineHarness(method='ren_balanced')
+    args = _args(method='ren_balanced', round=3, global_batch_prompts=4,
+                 collocate_hindsight_student=True, rollout_backend='hf', lora_rank=0)
+    persistent.pipeline_round(args, workers, workers.students, workers.hindsight, workers.teacher)
+    last_collection = max(i for i, event in enumerate(workers.events)
+                          if event[:3] == ('receive', 'student', 'collected'))
+    first_hindsight = workers.events.index(('send', 'hindsight', 'score', None))
+    assert last_collection < first_hindsight
+    assert ('send', 'hindsight', 'sync_checkpoint', None) in workers.events
+    assert workers.events.index(('send', 'teacher', 'score', None)) < first_hindsight
 
 
 @pytest.mark.parametrize('role,op,field,value,match', [

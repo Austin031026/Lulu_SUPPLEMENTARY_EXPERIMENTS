@@ -43,6 +43,8 @@ def parser():
                    help='Resident GPU roles and in-memory pipeline, or legacy subprocess phases')
     p.add_argument('--student-gpus', default='auto', help='Persistent backend: disjoint GPU IDs for Student DDP')
     p.add_argument('--hindsight-gpus', default='auto', help='Persistent backend: one GPU for synchronized privileged Student')
+    p.add_argument('--collocate-hindsight-student', action='store_true',
+                   help='Two-GPU HinD: run the privileged Student on the Student GPU after collection')
     p.add_argument('--teacher-gpus', default='auto', help='Persistent backend: GPU IDs in one true tensor-parallel group')
     p.add_argument('--save-every', type=int, default=20, help='Retain every N updates; persistent latest is saved each update')
     p.add_argument('--retain-checkpoints', default='', help='Extra completed round/update indices to retain')
@@ -113,6 +115,10 @@ def parser():
 
 
 def validate_args(a):
+    if getattr(a, 'collocate_hindsight_student', False) and (
+            a.backend != 'persistent' or a.cpu or a.method != 'ren_balanced'
+            or a.rollout_backend != 'hf' or a.lora_rank != 0):
+        raise ValueError('Two-GPU HinD collocation requires persistent full-parameter ren_balanced with HF rollout')
     if getattr(a, 'cost_mode', False):
         if a.method != 'ren_balanced' or a.backend != 'persistent' or a.reasoning_ablation not in ('ren', 'low_kl_matched', 'entropy_matched', 'vanilla', 'opsd'):
             raise ValueError('cost-mode requires persistent ren_balanced ren/low_kl_matched/entropy_matched/vanilla/opsd')
