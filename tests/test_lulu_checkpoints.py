@@ -64,6 +64,17 @@ def test_default_cadence_latest_weights_and_optimizer_survive_reload(tmp_path):
     assert manifest['checkpoint'] == str(latest)
 
 
+def test_staged_four_digit_rounds_retain_every_twenty_and_resume(tmp_path):
+    manager = CheckpointManager(tmp_path, index_unit='rounds', width=4)
+    for round_index in range(22):
+        manager.save(FakeModel(round_index), FakeTokenizer(), FakeOptimizer(round_index),
+                     round_index, {'completed_rounds': round_index}, final=round_index == 21)
+    assert names(manager) == ['round_0000', 'round_0020', 'round_0021']
+    resumed = CheckpointManager(tmp_path, index_unit='rounds', width=4)
+    assert resumed.latest_metadata()['completed_rounds'] == 21
+    assert torch.load(resumed.latest_path() / 'optimizer.pt', weights_only=True)['state'][0]['step'].item() == 21
+
+
 def test_failed_model_save_preserves_latest_and_retry_recovers(tmp_path):
     manager = CheckpointManager(tmp_path, save_every=3)
     first = save(manager, 0)

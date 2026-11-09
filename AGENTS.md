@@ -1,5 +1,9 @@
 # ArcQ new-cluster operating rules
 
+For CINECA access, current cluster paths, Slurm allocations, and verified code
+provenance, read [CINECA.md](CINECA.md) before acting on this cluster. Maintain
+CINECA-specific operational information in that file.
+
 ## Scope and default cluster
 
 - Unless the user explicitly says to switch to the old cluster, all setup,

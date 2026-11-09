@@ -46,7 +46,7 @@ def parser():
     p.add_argument('--collocate-hindsight-student', action='store_true',
                    help='Two-GPU HinD: run the privileged Student on the Student GPU after collection')
     p.add_argument('--teacher-gpus', default='auto', help='Persistent backend: GPU IDs in one true tensor-parallel group')
-    p.add_argument('--save-every', type=int, default=20, help='Retain every N updates; persistent latest is saved each update')
+    p.add_argument('--save-every', type=int, default=20, help='Retain every N rounds/updates; latest is saved after each completed round/update')
     p.add_argument('--retain-checkpoints', default='', help='Extra completed round/update indices to retain')
     p.add_argument('--master-weights-fp32', action='store_true', help='Keep full-training weights and Adam states in FP32; use BF16 autocast for compute')
     p.add_argument('--rollout-backend', choices=('hf', 'vllm'), default='hf')
@@ -209,6 +209,12 @@ def load_tensor_file(path):
 def paths(a):
     root = Path(a.output_dir).resolve()
     return root, root / 'round_cache' / f'round_{a.round:04d}', root / 'checkpoints' / f'round_{a.round:04d}'
+
+
+def staged_checkpoint_manager(a):
+    from lulu.checkpoints import CheckpointManager
+    return CheckpointManager(a.output_dir, a.save_every, index_unit='rounds', width=4,
+        retain_steps=[int(x) for x in a.retain_checkpoints.split(',') if x.strip()])
 
 
 def seed_all(seed):
@@ -390,7 +396,8 @@ def init_phase(a):
             lora_dropout=0.0, target_modules=a.lora_target_modules.split(','),
             bias='none', task_type='CAUSAL_LM'))
     tok = load_tokenizer(a.model)
-    save_checkpoint(model, tok, current, metadata={'completed_rounds': 0, 'model': a.model})
+    staged_checkpoint_manager(a).save(model, tok, None, 0,
+        {'completed_rounds': 0, 'model': a.model, 'method': a.method})
 
 
 def collect_phase(a):
@@ -489,6 +496,8 @@ def collect_phase(a):
 def teacher_phase(a):
     if a.method == 'opsd':
         return
+    if int(os.environ.get('WORLD_SIZE', '1')) > 1:
+        return teacher_tp_phase(a)
     from transformers import AutoModelForCausalLM
     _, cache, _ = paths(a)
     student_tok, teacher_tok = load_tokenizer(a.model), load_tokenizer(a.teacher_model)
@@ -538,6 +547,43 @@ def teacher_phase(a):
                 atomic_torch(path, record)
         print(json.dumps({'phase': 'teacher', 'worker': a.worker_rank, 'done': min(start+a.score_batch_size, len(files)),
                           'total': len(files)}), flush=True)
+
+
+def teacher_tp_phase(a):
+    """Score one staged round with the existing Qwen3 eager-local TP Teacher."""
+    from lulu.teacher_service import _full_tensor, _load_teacher, sanitize_score_request, score_records
+    rank = int(os.environ['RANK'])
+    world = int(os.environ['WORLD_SIZE'])
+    if world != a.teacher_gpus_per_worker or a.teacher_tp_mode != 'eager-local':
+        raise ValueError('Staged TP requires one eager-local Teacher rank per GPU')
+    torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
+    dist.init_process_group('nccl')
+    try:
+        _, cache, _ = paths(a)
+        teacher, tokenizer = _load_teacher(a, world, torch.device('cuda', torch.cuda.current_device()))
+        if a.method in ('vanilla_opd', 'ren_opd'):
+            head = teacher.get_output_embeddings()
+            weight = _full_tensor(head.weight.detach()).cpu().contiguous()
+            bias = None if getattr(head, 'bias', None) is None else _full_tensor(head.bias.detach()).cpu().contiguous()
+            if rank == 0:
+                atomic_torch(cache / 'teacher_head.pt', {'weight': weight, 'bias': bias})
+        files = sorted(cache.glob('rollout_*.pt'))
+        for index, path in enumerate(files, 1):
+            record = load_tensor_file(path)
+            request = sanitize_score_request({
+                'op': 'score', 'round': a.round, 'request_id': index,
+                'records': [{key: record[key] for key in ('causal_prompt_ids', 'response_ids', 'positions')}],
+            }, a.method, vocab_size=teacher.get_output_embeddings().weight.shape[0],
+                max_sequence_tokens=a.max_sequence_tokens)
+            result = score_records(teacher, tokenizer, request['records'], a)[0]
+            if rank == 0:
+                record.update(result)
+                atomic_torch(path, record)
+                print(json.dumps({'phase': 'teacher_tp', 'done': index,
+                                  'total': len(files), 'tp_world': world}), flush=True)
+            dist.barrier()
+    finally:
+        dist.destroy_process_group()
 
 
 class DistillationStep(nn.Module):
@@ -694,11 +740,10 @@ def update_phase(a):
         if rank == 0:
             print(json.dumps(entry), flush=True)
     if rank == 0:
-        next_path = root / 'checkpoints' / f'round_{a.round+1:04d}'
-        save_checkpoint(student, tok, next_path, optimizer,
-                        {'completed_rounds': a.round+1, 'model': a.model, 'method': a.method, 'metrics': metrics})
         atomic_json(root / 'metrics' / f'round_{a.round:04d}.json', metrics)
-        atomic_json(root / 'latest.json', {'checkpoint': str(next_path), 'completed_rounds': a.round+1})
+        staged_checkpoint_manager(a).save(student, tok, optimizer, a.round + 1,
+            {'completed_rounds': a.round+1, 'model': a.model, 'method': a.method, 'metrics': metrics},
+            final=a.round + 1 == a.rounds)
     if world > 1:
         dist.barrier()
         dist.destroy_process_group()
@@ -763,7 +808,11 @@ def run_teachers(a, round_index, ids):
     workers = []
     try:
         for rank, group in enumerate(groups):
-            cmd = [sys.executable, '-m', 'lulu.training'] + child_arguments(a, 'teacher', round_index)
+            cmd = [sys.executable]
+            if len(group) > 1 and a.teacher_tp_mode == 'eager-local':
+                cmd += ['-m', 'torch.distributed.run', '--standalone', '--nnodes', '1',
+                        '--nproc_per_node', str(len(group))]
+            cmd += ['-m', 'lulu.training'] + child_arguments(a, 'teacher', round_index)
             cmd += ['--worker-rank', str(rank), '--worker-world', str(len(groups))]
             env = dict(os.environ, CUDA_VISIBLE_DEVICES=','.join(group), TOKENIZERS_PARALLELISM='false',
                        OMP_NUM_THREADS=os.environ.get('OMP_NUM_THREADS', '1'))
@@ -790,7 +839,7 @@ def resume_settings(config):
     config = dict(config)
     config.setdefault('backend', 'staged')  # Manifests before resident training.
     if config['backend'] == 'staged':
-        for key in ('student_gpus', 'hindsight_gpus', 'teacher_gpus', 'save_every', 'worker_timeout'):
+        for key in ('student_gpus', 'hindsight_gpus', 'teacher_gpus', 'worker_timeout'):
             config.pop(key, None)
     return {key: value for key, value in config.items() if key not in {'train_data', 'output_dir'}}
 
@@ -823,13 +872,22 @@ def run(a):
         if root.exists() and any(root.iterdir()):
             raise FileExistsError('Output directory must be empty for a new run')
         atomic_json(manifest_path, config)
-    initial = root / 'checkpoints' / 'round_0000'
-    if not (initial / 'lulu_state.json').exists():
-        run_phase(a, 'init', 0, ids[:1])
-    for round_index in range(a.rounds):
-        finished = root / 'checkpoints' / f'round_{round_index+1:04d}' / 'lulu_state.json'
-        if finished.exists():
-            continue
+    manager = staged_checkpoint_manager(a)
+    latest = manager.latest_metadata()
+    if latest is None:
+        # Older staged runs did not publish a managed latest link. Resume from
+        # their last contiguous committed round without deleting old checkpoints.
+        completed = 0
+        while (root / 'checkpoints' / f'round_{completed+1:04d}' / 'lulu_state.json').is_file():
+            completed += 1
+        initial = root / 'checkpoints' / 'round_0000' / 'lulu_state.json'
+        if not initial.is_file():
+            run_phase(a, 'init', 0, ids[:1])
+    else:
+        completed = latest['completed_rounds']
+    if completed > a.rounds:
+        raise ValueError('Latest checkpoint exceeds requested rounds')
+    for round_index in range(completed, a.rounds):
         cache = root / 'round_cache' / f'round_{round_index:04d}'
         if cache.exists():
             shutil.rmtree(cache)  # Only this run's incomplete, regenerable cache.

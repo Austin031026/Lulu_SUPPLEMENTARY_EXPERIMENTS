@@ -28,15 +28,18 @@ class CheckpointManager:
     Calls must be serialized (normally only Student rank zero calls ``save``).
     """
 
-    def __init__(self, output_root, save_every: int = 20, *, retain_steps=(), index_unit="updates"):
+    def __init__(self, output_root, save_every: int = 20, *, retain_steps=(), index_unit="updates", width=6):
         if isinstance(save_every, bool) or not isinstance(save_every, int) or save_every < 1:
             raise ValueError("save_every must be a positive integer")
         if index_unit not in ("updates", "rounds"):
             raise ValueError("index_unit must be updates or rounds")
+        if isinstance(width, bool) or not isinstance(width, int) or width < 4:
+            raise ValueError("width must be an integer of at least four")
+        self.width = width
         self.index_unit = index_unit
         self.index_field = "completed_" + index_unit
         self.prefix = "step" if index_unit == "updates" else "round"
-        self.pattern = re.compile(self.prefix + r"_(\d{6,})\Z")
+        self.pattern = re.compile(self.prefix + rf"_(\d{{{width},}})\Z")
         self.retain_steps = tuple(sorted(set(retain_steps)))
         if any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in self.retain_steps):
             raise ValueError("retain_steps must contain nonnegative integers")
@@ -129,7 +132,7 @@ class CheckpointManager:
             "index_unit": self.index_unit, "retain_steps": list(self.retain_steps),
             "final": bool(final),
         }
-        path = self.directory / f"{self.prefix}_{step:06d}"
+        path = self.directory / f"{self.prefix}_{step:0{self.width}d}"
         if path.is_symlink():
             raise FileExistsError(f"Refusing to replace checkpoint symlink: {path}")
         if path.exists():

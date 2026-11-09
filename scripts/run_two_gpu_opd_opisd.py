@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the existing OPD and OPSD objectives with two A100 80GB GPUs.
+"""Plan or run OPD/OPSD on two A100s: 64GB staged, 80GB resident.
 
 The default performs asset and hardware checks; --run starts training.
 """
@@ -16,7 +16,7 @@ import sys
 import time
 
 CODE = Path(__file__).resolve().parents[1]
-POOL_SHA = "7d8e0ef07b341b90a71958e4513bacdc3e086e152f55d47245c7dd9871bc5cc4"
+POOL_SHA = "d62f4902220b73919392676e0538b6add33ed42f6a7f4f9a4137ef16898190fb"
 
 
 def sha256(path: Path) -> str:
@@ -54,18 +54,17 @@ def gpu_info(ids: list[str]) -> dict[str, dict]:
 
 
 def command(assets: dict, output: Path, method: str, ids: list[str], rounds: int,
-            batch: int, max_new_tokens: int) -> list[str]:
+            batch: int, max_new_tokens: int, *, staged: bool = False) -> list[str]:
     student, service = ids
     cmd = [sys.executable, "-u", str(CODE / "scripts/train_lulu.py"),
-           "--model", assets["student"]["path"], "--teacher-model", assets["teacher"]["path"],
+           "--model", assets["student"]["path"],
            "--train-data", assets["pool"], "--output-dir", str(output),
            "--method", "vanilla_opd" if method == "opd" else "opsd",
-           "--backend", "persistent", "--gpus", ",".join(ids), "--student-gpus", student,
+           "--backend", "staged" if staged else "persistent", "--gpus", ",".join(ids),
            "--rounds", str(rounds), "--global-batch-prompts", str(batch),
            "--rollouts-per-prompt", "1", "--update-passes", "1",
-           "--rollout-backend", "vllm", "--rollout-batch-size", "4",
-           "--rollout-top-k", "20", "--rollout-vllm-memory", "0.35",
-           "--rollout-vllm-max-seqs", "8", "--score-batch-size", "1",
+           "--rollout-backend", "hf" if staged else "vllm", "--rollout-batch-size", "4",
+           "--rollout-top-k", "20", "--score-batch-size", "1",
            "--train-micro-batch-size", "1", "--logit-chunk-size", "64",
            "--max-new-tokens", str(max_new_tokens), "--max-prompt-tokens", "4096",
            "--max-sequence-tokens", str(max(16384, 4096 + max_new_tokens)),
@@ -74,10 +73,17 @@ def command(assets: dict, output: Path, method: str, ids: list[str], rounds: int
            "--lora-rank", "0", "--master-weights-fp32", "--dtype", "bfloat16",
            "--gradient-checkpointing", "--gradient-norm-every", "0",
            "--validation-every", "0", "--no-stability-early-stop",
-           "--save-every", "50", "--retain-checkpoints", f"0,{rounds}",
+           "--save-every", "20", "--retain-checkpoints", f"0,{rounds}",
            "--worker-timeout", "7200", "--seed", "42"]
-    cmd += (["--teacher-gpus", service, "--teacher-gpus-per-worker", "1"]
-            if method == "opd" else ["--hindsight-gpus", service])
+    if method == "opd":
+        cmd += ["--teacher-model", assets["teacher"]["path"]]
+    if staged:
+        cmd += ["--teacher-gpus-per-worker", "2", "--teacher-tp-mode", "eager-local"]
+    else:
+        cmd += ["--student-gpus", student, "--rollout-vllm-memory", "0.35",
+                "--rollout-vllm-max-seqs", "8"]
+        cmd += (["--teacher-gpus", service, "--teacher-gpus-per-worker", "1"]
+                if method == "opd" else ["--hindsight-gpus", service])
     return cmd
 
 
@@ -99,15 +105,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arcq-root", default=os.environ.get("ARCQ_ROOT"))
     parser.add_argument("--gpus", default="0,1")
-    parser.add_argument("--method", choices=("opd", "opisd", "both"), default="both")
+    parser.add_argument("--method", choices=("opd", "opsd", "opisd", "both"), default="both",
+                        help="OPD, OPSD, or both; opisd remains an accepted legacy spelling")
     parser.add_argument("--rounds", type=int, default=200)
     parser.add_argument("--global-batch-prompts", type=int, default=16)
     parser.add_argument("--max-new-tokens", type=int, default=8192)
+    parser.add_argument("--train-data", help="Prepared 2048-question JSONL; defaults to the CINECA project pool")
     parser.add_argument("--output-dir")
     parser.add_argument("--run", action="store_true")
+    parser.add_argument("--resume", action="store_true", help="Resume this run from each method's committed latest checkpoint")
     args = parser.parse_args()
     if not args.arcq_root:
         parser.error("Set ARCQ_ROOT or pass --arcq-root")
+    if args.resume and (not args.run or not args.output_dir):
+        parser.error("--resume requires --run and --output-dir")
     if min(args.rounds, args.global_batch_prompts, args.max_new_tokens) < 1:
         parser.error("Rounds, batch size and max-new-tokens must be positive")
     ids = [part.strip() for part in args.gpus.split(",")]
@@ -118,44 +129,72 @@ def main() -> int:
               root / "experiments/two_gpu_opd_opisd" / time.strftime("run_%Y%m%dT%H%M%SZ", time.gmtime()))
     if not output.is_relative_to(root / "experiments"):
         parser.error("Output must stay under ARCQ_ROOT/experiments")
-    pool = root / "data/prepared/dapo_pool2048_s42/train.jsonl"
-    if sha256(pool) != POOL_SHA:
-        raise ValueError("Historical 2048-question pool SHA256 mismatch")
+    pool = (Path(args.train_data).resolve(strict=True) if args.train_data else
+            root / "data/prepared/dapo_pool2048_s42/train.jsonl")
+    if not pool.is_relative_to(root / "data/prepared"):
+        parser.error("Training data must stay under ARCQ_ROOT/data/prepared")
+    actual_pool_sha = sha256(pool)
+    if actual_pool_sha != POOL_SHA:
+        raise ValueError(f"CINECA 2048-question pool SHA256 mismatch: {actual_pool_sha}; expected {POOL_SHA}")
+    selected = ("opd", "opsd") if args.method == "both" else ("opsd" if args.method == "opisd" else args.method,)
     assets = {"student": model_info(root / "models/Qwen3-1.7B"),
-              "teacher": model_info(root / "models/Qwen3-32B"),
               "pool": str(pool), "pool_sha256": POOL_SHA}
+    if "opd" in selected:
+        assets["teacher"] = model_info(root / "models/Qwen3-32B")
     hardware = gpu_info(ids)
-    if any(item["total_mib"] < 75 * 1024 for item in hardware.values()):
-        raise RuntimeError("Two A100 80GB-class GPUs required")
-    selected = ("opd", "opisd") if args.method == "both" else (args.method,)
-    if "opd" in selected and hardware[ids[1]]["free_mib"] < int((assets["teacher"]["weight_gib_on_disk"] + 10) * 1024):
+    if any("A100" not in item["name"] or item["total_mib"] < 60 * 1024 for item in hardware.values()):
+        raise RuntimeError("Two A100 GPUs with at least 60 GiB each required")
+    staged = any(item["total_mib"] < 75 * 1024 for item in hardware.values())
+    if "opd" in selected and not staged and hardware[ids[1]]["free_mib"] < int((assets["teacher"]["weight_gib_on_disk"] + 10) * 1024):
         raise RuntimeError("Teacher GPU lacks memory for single-GPU 32B attempt")
-    if args.run and any(hardware[gpu]["free_mib"] < 73 * 1024 for gpu in ids):
-        raise RuntimeError("Both GPUs need at least 73 GiB free before training")
+    minimum_free = 55 if staged else 73
+    if args.run and any(hardware[gpu]["free_mib"] < minimum_free * 1024 for gpu in ids):
+        raise RuntimeError(f"Both GPUs need at least {minimum_free} GiB free before training")
     if args.run and shutil.disk_usage(root).free < 150 * 2**30:
         raise RuntimeError("Less than 150 GiB free for checkpoints")
     commands = {name: command(assets, output / name / "train", name, ids,
-                              args.rounds, args.global_batch_prompts, args.max_new_tokens)
+                              args.rounds, args.global_batch_prompts, args.max_new_tokens,
+                              staged=staged)
                 for name in selected}
     commit = subprocess.run(["git", "-C", str(CODE), "rev-parse", "HEAD"], capture_output=True, text=True)
-    plan = {"schema_version": 1, "mode": "two_gpu_opd_opisd", "git_commit": commit.stdout.strip(),
-            "root": str(root), "output_dir": str(output), "assets": assets, "hardware": hardware,
+    source_hashes = {name: sha256(CODE / name) for name in (
+        "scripts/run_two_gpu_opd_opisd.py", "scripts/train_lulu.py",
+        "lulu/training.py", "lulu/checkpoints.py")}
+    plan = {"schema_version": 2, "mode": "two_gpu_opd_opisd", "git_commit": commit.stdout.strip(),
+            "source_sha256": source_hashes, "root": str(root), "output_dir": str(output),
+            "assets": assets, "hardware": hardware,
+            "execution": "staged_tp2_teacher" if staged else "persistent_single_gpu_teacher",
             "rounds": args.rounds, "global_batch_prompts": args.global_batch_prompts,
+            "save_every": 20, "retained_checkpoints": list(range(0, args.rounds + 1, 20)) + ([args.rounds] if args.rounds % 20 else []),
             "rollouts_per_prompt": 1, "scheduled_prompt_uses": args.rounds * args.global_batch_prompts,
-            "teacher_single_gpu_feasibility": "estimated_only; actual load/smoke required", "commands": commands}
+            "teacher_feasibility": "estimated_only; actual load/smoke required" if "opd" in selected else "not_used_by_opsd",
+            "commands": commands}
     print(json.dumps(plan, indent=2, ensure_ascii=False), flush=True)
     if not args.run:
         print("PREFLIGHT=PASS; add --run to start", flush=True)
         return 0
-    if output.exists() and any(output.iterdir()):
-        raise FileExistsError(output)
-    output.mkdir(parents=True)
-    (output / "experiment_plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+    if args.resume:
+        saved = json.loads((output / "experiment_plan.json").read_text())
+        if (saved["commands"] != commands or saved["assets"] != assets
+                or saved.get("source_sha256") != source_hashes):
+            raise ValueError("Resume command, pinned assets, or source code differs from the original run")
+    else:
+        if output.exists() and any(output.iterdir()):
+            raise FileExistsError(output)
+        output.mkdir(parents=True)
+        (output / "experiment_plan.json").write_text(json.dumps(plan, indent=2) + "\n")
     for name in selected:
-        log = output / name / "train.log"
+        checkpoint = output / name / "train/checkpoints" / f"round_{args.rounds:0{4 if staged else 6}d}"
+        if args.resume and (checkpoint / "lulu_state.json").is_file():
+            print(f"ALREADY_COMPLETE={name}; CHECKPOINT={checkpoint}", flush=True)
+            continue
+        log = output / name / (f"train.resume-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.log" if args.resume else "train.log")
         started = time.time()
-        returncode = run_command(commands[name], log)
-        checkpoint = output / name / "train/checkpoints" / f"round_{args.rounds:06d}"
+        train_dir = output / name / "train"
+        resume_arm = args.resume and (train_dir / "run_config.json").is_file()
+        if args.resume and not resume_arm and train_dir.exists() and any(train_dir.iterdir()):
+            raise FileExistsError(f"Uncommitted training directory needs inspection: {train_dir}")
+        returncode = run_command(commands[name] + (["--resume"] if resume_arm else []), log)
         if returncode == 0 and not (checkpoint / "lulu_state.json").is_file():
             returncode = 1
         status = {"method": name, "returncode": returncode, "wall_seconds": time.time() - started,
